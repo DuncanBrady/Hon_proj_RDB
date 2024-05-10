@@ -7,6 +7,16 @@ The field of Spatial transcriptomics has seen major development in recent years 
 # Project Scope
 This project explores the application of Graph Neural Networks to Spatial Transcriptomic data within the context of Cellular communication analysis. All data being examined is sourced from Spatial Transcriptomic technologies, specifically MERfish and Seqfish datasets. 
 # Aims
-TBC
+The goals of the project are to explore the effectiveness of Graph Neural Networks at prediction of cell-cell interaction when treated as a link prediction task for Spatial transcriptomic data. In order to do so the following considerations will be addressed
+- The inclusion of cellular distance and cell type as edge level features in the cellular graph representation
+- The application of Graph Attention Mechanisms in link prediction for Cellular Graphs
+- The application of Edge-Featured Graph attention Networks in link prediction
+
 # Methods
-TBC
+## Data Processing
+
+## Model Architecture
+
+## Training and Evaluation 
+
+# Data Availability
