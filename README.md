@@ -16,6 +16,11 @@ The goals of the project are to explore the effectiveness of Graph Neural Networ
 ## Data Processing
 
 ## Model Architecture
+### GCN Model
+
+### Attention Based Model
+
+### Edge Based Attetion Model
 
 ## Training and Evaluation 
 
