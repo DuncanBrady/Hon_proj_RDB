@@ -1,6 +1,6 @@
 import sys
 import pytest
-from train.train import main
+from src.train.train import main
 
 
 class TestTrain:
