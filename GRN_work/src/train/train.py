@@ -40,6 +40,8 @@ def check_opts(opts):
 
 def main():
     opts = parse_opts()
+    print(type(opts))
+    print(opts)
     check_opts(opts)
 
     # Extract options
