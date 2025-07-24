@@ -1,25 +1,20 @@
 # Configuration file for data directory location
 data_path: "../../../data"
 
-# Options for manual encoder and decoder selection
-enocders: ["onehot", "label", "ordinal"]
-decoders: ["onehot", "label", "ordinal"]
-# Configuration for the model
+enocders: ["Sequential"]
+decoders: ["Sequential"]
+encoder_decoder_pairs:
+- !!python/tuple
+  - Sequential
+  - Sequential
+
+
 models: {
-    "model1": {
-        "encoder": "onehot",
-        "decoder": "label",
-        "params": {
-            "layers": [64, 32],
-            "activation": "relu"
-        }
-    },
-    "model2": {
-        "encoder": "label",
-        "decoder": "ordinal",
-        "params": {
-            "layers": [128, 64],
-            "activation": "tanh"
-        }
+    "ConvAutoencoder": {
+        "encoder": "Sequential",
+        "decoder": "Sequential",
     }
 }
+
+loss_functions: { "werighted_huber": [],}
+
