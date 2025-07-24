@@ -5,30 +5,31 @@ from src.train.train import main
 
 class TestTrain:
     def test_help_option_long(self, capsys, monkeypatch):
-        monkeypatch.setattr(sys, 'argv', ['train.py', '--help'])
+        monkeypatch.setattr(sys, 'argv', ['train.py', '--help', '--test'])
         with pytest.raises(SystemExit):
             main()
         captured = capsys.readouterr()
-        assert "Usage: python train.py" in captured.out
-        assert "Optional Args:" in captured.out
+        assert "Usage: train.py" in captured.out
+        assert "Options:" in captured.out
 
     def test_help_option_short(self, capsys, monkeypatch):
-        monkeypatch.setattr(sys, 'argv', ['train.py', '-h'])
+        monkeypatch.setattr(sys, 'argv', ['train.py', '-h', '--test '])
         with pytest.raises(SystemExit):
             main()
         captured = capsys.readouterr()
-        assert "Usage: python train.py " in captured.out
-        assert "Optional Args:" in captured.out
-'''
-    def test_model_option(self, capsys):
-        with pytest.raises(SystemExit):
-            main(['-m', 'test1'])
-        captured = capsys.readouterr()
-        assert "Choosing model to train...test1" in captured.out
+        assert "Usage: train.py" in captured.out
+        assert "Options:" in captured.out
 
-    def test_encoder_decoder_option(self, capsys):
+    def test_model_option(self, capsys, monkeypatch):
+        monkeypatch.setattr(sys, 'argv', ['train.py', '-m', 'test1', '--test'])
         with pytest.raises(SystemExit):
-            main(['-e', 'simple', '-d', 'resnet'])
+            main()
         captured = capsys.readouterr()
-        assert "Choosing encoder-decoder architecture..." in captured.out
-        '''
+        assert "Training model: test1" in captured.out
+
+    def test_encoder_decoder_option(self, capsys, monkeypatch):
+        monkeypatch.setattr(sys, 'argv', ['train.py', '-e', 'simple', '-d', 'resnet', '--test'])
+        with pytest.raises(SystemExit):
+            main()
+        captured = capsys.readouterr()
+        assert "Using encoder: simple and decoder: resnet" in captured.out
