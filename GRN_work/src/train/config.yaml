@@ -1,20 +1,20 @@
 # Configuration file for data directory location
-data_path: "../../../data"
+data_path: 'C:\Users\rdbra\Documents\honoursProject\code_base\data\'
 
-enocders: ["Sequential"]
-decoders: ["Sequential"]
+encoders: ["sequential", "valid_encoder"]
+decoders: ["sequential", "valid_decoder"]
 encoder_decoder_pairs:
 - !!python/tuple
-  - Sequential
-  - Sequential
+  - sequential
+  - sequential
 
 
 models: {
-    "ConvAutoencoder": {
-        "encoder": "Sequential",
-        "decoder": "Sequential",
+    "convautoencoder": {
+        "encoder": "sequential",
+        "decoder": "sequential",
     }
 }
 
-loss_functions: { "werighted_huber": [],}
+loss_functions: { "weighted_huber": [],}
 
