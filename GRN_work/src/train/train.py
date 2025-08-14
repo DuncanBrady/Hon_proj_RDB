@@ -1,6 +1,7 @@
 # This is the training script that will be used to train multiple autoencoders.
 import optparse, sys, os
 from src.train import config as train_config
+#import config as train_config
 def parse_opts():
 
     try:
@@ -29,7 +30,8 @@ def parse_opts():
 
     return parser
 
-def check_opts(parser):
+def check_req_opts(parser):
+
     opts, _, = parser.parse_args()
     if not opts.file and not opts.test:
         print("Error: The --file option is required.")
@@ -61,6 +63,33 @@ def check_opts(parser):
         parser.print_help()
         sys.exit(2)
 
+def check_dataset_file(file_path):
+    dataset_path = os.path.join(train_config.data_path, file_path)
+    if not os.path.exists(dataset_path):
+        print(f"Error: Dataset file '{file_path}' does not exist in the specified data path '{dataset_path}'.")
+        sys.exit(2)
+
+def check_output_dir(output_dir):
+    output_dir = os.path.join(train_config.data_path, output_dir)
+    if not os.path.exists(output_dir):
+        try:
+            os.makedirs(output_dir)
+        except OSError as e:
+            print(f"Error: Could not create output directory '{output_dir}'. {e}")
+            sys.exit(2)
+    else:
+        '''
+        print(f"Output directory '{output_dir}' already exists. Do you want to save results there ? (y/n)")
+        response = input().strip()
+        if response != 'y':
+            new_path = input("Please specify a different output directory: ")
+            check_output_dir(new_path)
+        else: 
+            print(f'Results will be saved in {output_dir}, some files may be overwritten.')
+            '''
+        print(f"Output directory '{output_dir}' is ready for saving results.")
+
+
 def check_model_config(model_name=None):
     if model_name and model_name not in train_config.models:
         print(f"Error: Model '{model_name}' is not defined in the configuration.")
@@ -74,7 +103,7 @@ def check_encoder_decoder(encoder_name=None, decoder_name=None):
     if decoder_name and decoder_name not in train_config.decoders:
         print(f"Error: Decoder '{decoder_name}' is not defined in the configuration.")
         sys.exit(2)
-    if (encoder_name and decoder_name) not in train_config.encoder_decoder_pairs:
+    if (encoder_name,decoder_name) not in train_config.encoder_decoder_pairs:
         print(f"Error: The combination of encoder '{encoder_name}' and decoder '{decoder_name}' is not valid.")
         sys.exit(2)
 
@@ -101,14 +130,16 @@ def train_model(model_name=None, encoder_name=None, decoder_name=None, loss=None
 
 def main():    
     parser = parse_opts()
-    check_opts(parser)
+    check_req_opts(parser)
     opts, args = parser.parse_args()
-    # Check if the dataset file exists
-    if opts.file:
-        dataset_path = os.path.join(data_path, opts.file)
-        if not os.path.exists(dataset_path):
-            print(f"Error: Dataset file '{opts.file}' does not exist in the specified data path '{data_path}'.")
-            sys.exit(2)
+    check_dataset_file(opts.file)
+    check_output_dir(opts.output)
+    # Check if the output directory exists, if not create i
+    if opts.model:
+        check_model_config(opts.model)
+    elif opts.encoder and opts.decoder:
+        check_encoder_decoder(opts.encoder, opts.decoder)
+    check_loss_function(opts.loss_function)
     train_model(
         model_name=opts.model,
         encoder_name=opts.encoder,
