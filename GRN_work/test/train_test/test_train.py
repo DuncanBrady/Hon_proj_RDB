@@ -1,6 +1,6 @@
 import sys
 import pytest
-from src.train.train import main
+from ...src.train.train import main
 
 class TestTrain:
     def test_help_option_long(self, capsys, monkeypatch):
