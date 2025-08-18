@@ -1,6 +1,7 @@
 # This is the training script that will be used to train multiple autoencoders.
 import optparse, sys, os
 from src.train import config as train_config
+from src.preprocess.binning import term_freq_bin
 #import config as train_config
 def parse_opts():
 
@@ -22,6 +23,8 @@ def parse_opts():
                         help="Specify the learning rate for training (default: 0.001)")
         parser.add_option("--ep", "--epochs", dest="epochs", default=10, type=int,
                         help="Specify the number of epochs for training (default: 10)")
+        parser.add_option("-b", "--bin_count", dest="bin_count", default=None, type=int,
+                        help="Specify the number of bins to use for data binning (default: None")
         parser.add_option("-t", "--test", action="store_true", dest="test", default=False, 
                         help="Use this option to run the script in test mode, which will not perform any training but will check the configuration and print the options")
     except optparse.BadOptionError as err:
@@ -60,6 +63,11 @@ def check_req_opts(parser):
 
     if opts.learning_rate <= 0:
         print("Error: The learning rate must be a positive number.")
+        parser.print_help()
+        sys.exit(2)
+        
+    if opts.bin_count is not None and opts.bin_count <= 0:
+        print("Error: The number of bins must be a positive integer.")
         parser.print_help()
         sys.exit(2)
 
@@ -140,6 +148,10 @@ def main():
     elif opts.encoder and opts.decoder:
         check_encoder_decoder(opts.encoder, opts.decoder)
     check_loss_function(opts.loss_function)
+    #Load the training data and perform any necessary preprocessing
+    data = np.load(opts.file)
+    if opts.binned:
+        data = term_freq_bin(data, num_bins=3)
     train_model(
         model_name=opts.model,
         encoder_name=opts.encoder,
