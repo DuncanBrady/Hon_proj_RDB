@@ -1,0 +1,7 @@
+Final Training Metrics
+==============================
+Final Loss: 0.106751
+Final Accuracy: 0.2296
+Best Loss: 0.106751
+Best Accuracy: 0.2296
+Total Parameters: 260,448

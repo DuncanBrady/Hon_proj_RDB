@@ -1,0 +1,8 @@
+Reconstruction Quality Summary
+========================================
+Original data shape: (1000, 2000)
+Reconstructed data shape: (1000, 2000)
+Mean Squared Error: 0.384273
+Mean Absolute Error: 0.450092
+Reconstruction Accuracy: 0.2777
+R² Score: -0.1997
