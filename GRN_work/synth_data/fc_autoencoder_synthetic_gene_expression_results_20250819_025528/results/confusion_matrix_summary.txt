@@ -1,0 +1,39 @@
+Confusion Matrix Analysis Summary
+========================================
+Dataset: fc_autoencoder_synthetic_gene_expression_results_20250819_025528
+Loss Type: mse
+Data Shape: (10000, 1)
+Number of Classes/Bins: 6
+Total Data Points: 10,000
+
+Metrics:
+  Overall Accuracy: 0.5209
+  Macro Precision: 0.1795
+  Macro Recall: 0.1751
+  Macro F1-Score: 0.1759
+
+Per-class Metrics:
+  Bin 0:
+    Precision: 0.4186
+    Recall: 0.3946
+    F1-Score: 0.4063
+  Bin 1:
+    Precision: 0.5871
+    Recall: 0.6244
+    F1-Score: 0.6052
+  Bin 2:
+    Precision: 0.0714
+    Recall: 0.0316
+    F1-Score: 0.0439
+  Bin 3:
+    Precision: 0.0000
+    Recall: 0.0000
+    F1-Score: 0.0000
+  Bin 4:
+    Precision: 0.0000
+    Recall: 0.0000
+    F1-Score: 0.0000
+  Bin 5:
+    Precision: 0.0000
+    Recall: 0.0000
+    F1-Score: 0.0000

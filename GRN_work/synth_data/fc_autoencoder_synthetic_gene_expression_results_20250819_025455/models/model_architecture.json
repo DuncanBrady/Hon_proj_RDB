@@ -1,0 +1,11 @@
+{
+  "input_dim": 2000,
+  "hidden_dims": [
+    64
+  ],
+  "latent_dim": 16,
+  "dropout_rate": 0.1,
+  "output_activation": "none",
+  "num_classes": null,
+  "total_parameters": 260448
+}
