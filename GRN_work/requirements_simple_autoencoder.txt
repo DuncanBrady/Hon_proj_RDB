@@ -1,0 +1,20 @@
+# Requirements for Simple Autoencoder Training
+
+# Core dependencies
+torch>=1.9.0
+numpy>=1.21.0
+
+# Optional but recommended for better performance
+tqdm>=4.62.0  # Progress bars
+
+# For data handling and utilities
+pathlib2>=2.3.6  # Better path handling (if using Python < 3.4)
+
+# Development and testing
+pytest>=6.2.0  # For running tests
+jupyter>=1.0.0  # For notebook analysis
+
+# Note: 
+# - torch installation might require specific CUDA version
+# - For CPU-only: pip install torch --index-url https://download.pytorch.org/whl/cpu
+# - For CUDA 11.8: pip install torch --index-url https://download.pytorch.org/whl/cu118
