@@ -8,6 +8,9 @@ def term_freq_bin(data, num_bins):
     #Get all non-zero values from the data
     non_zero_mask = np.nonzero(data)
     non_zero_vals = data[non_zero_mask]
+    #calculate percentage of values that are non-zero
+    non_zero_percentage = len(non_zero_vals) / data.size * 100 if data.size > 0 else 0
+    print(f"Percentage of non-zero values: {non_zero_percentage:.2f}%")
     if len(non_zero_vals) == 0:
         return data
 
@@ -30,3 +33,9 @@ def k_means_bin(data, num_bins):
     # Create bins based on labels
     bins = [data[labels == i] for i in range(num_bins)]
     return bins
+
+if __name__ == "__main__":
+    # Example usage
+    data = np.load(data)['arr_0']
+    binned_data = term_freq_bin(data, num_bins=5)
+    print("Binned data (Term Frequency):", binned_data)
