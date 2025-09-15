@@ -1,4 +1,4 @@
-#! bin/bash
+#! /bin/bash
 
 #PBS -P yr31
 #PBS -q gpuvolta
