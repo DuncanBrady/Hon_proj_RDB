@@ -166,8 +166,9 @@ def _compute_per_bin_stats(original_batch: torch.Tensor, reconstructed_batch: to
       per_bin_correct, per_bin_total, per_bin_loss_sum (all length num_bins)
     """
     # Move to CPU for numpy operations
-    orig = original_batch.detach().cpu().numpy()
-    recon = reconstructed_batch.detach().cpu().numpy()
+    # Force float32 to avoid upcasting to float64 in older PyTorch / NumPy interactions
+    orig = original_batch.detach().to(torch.float32).cpu().numpy()
+    recon = reconstructed_batch.detach().to(torch.float32).cpu().numpy()
 
     # Determine bin indices for original data (bins start at 0; zero values remain 0)
     # We assume term_freq_bin produced integer bin labels 0..num_bins with 0 reserved for zeros; adjust if max == num_bins

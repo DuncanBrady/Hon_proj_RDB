@@ -89,12 +89,17 @@ class ConfusionMatrixAccumulator:
         self.num_bins = num_bins
         self.matrix = torch.zeros((num_bins+1, num_bins+1), dtype=torch.int64)  # include zero bin
     def update(self, y_true_bins: torch.Tensor, y_pred_bins: torch.Tensor):
-        # flatten
-        t = y_true_bins.view(-1)
-        p = y_pred_bins.view(-1)
-        for i in range(self.num_bins+1):
-            for j in range(self.num_bins+1):
-                self.matrix[i, j] += torch.sum((t == i) & (p == j))
+        # Vectorized update using combined indices for speed
+        t = y_true_bins.view(-1).to(torch.int64)
+        p = y_pred_bins.view(-1).to(torch.int64)
+        valid = (t >= 0) & (t <= self.num_bins) & (p >= 0) & (p <= self.num_bins)
+        if not torch.any(valid):
+            return
+        t = t[valid]
+        p = p[valid]
+        idx = t * (self.num_bins + 1) + p
+        counts = torch.bincount(idx, minlength=(self.num_bins + 1) ** 2)
+        self.matrix += counts.view(self.num_bins + 1, self.num_bins + 1)
     def as_dict(self):
         return self.matrix.tolist()
 
@@ -155,9 +160,13 @@ def train():
     cm_acc = ConfusionMatrixAccumulator(CFG.num_bins)
 
     def dynamic_acc_thresh(y_true: torch.Tensor) -> torch.Tensor:
+        # Ensure constants share dtype/device with y_true (Torch 1.10 strict where rule)
+        zero_tol = torch.full_like(y_true, 0.05)
+        small_tol = torch.full_like(y_true, 0.1)
+        scaled = 0.1 * y_true
         return torch.where(
-            y_true == 0, 0.05,
-            torch.where((y_true > 0) & (y_true < 1), 0.1, 0.1 * y_true)
+            y_true == 0, zero_tol,
+            torch.where((y_true > 0) & (y_true < 1), small_tol, scaled)
         )
 
     best_macro_bin_acc = 0.0

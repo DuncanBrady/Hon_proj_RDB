@@ -307,6 +307,10 @@ def calculate_accuracy(reconstructed, original, threshold_factor=0.1, loss_type=
     Returns:
         float: Accuracy percentage
     """
+    # Ensure dtype alignment (older torch versions are stricter with torch.where)
+    if reconstructed.dtype != original.dtype:
+        original = original.to(reconstructed.dtype)
+
     if loss_type.lower() in ['cross_entropy', 'ce']:
         # For cross-entropy, calculate classification accuracy
         if reconstructed.dim() == 3:
@@ -326,15 +330,18 @@ def calculate_accuracy(reconstructed, original, threshold_factor=0.1, loss_type=
         
     else:
         # For MSE and Huber loss, use threshold-based accuracy
-        # Dynamic threshold based on original values
+        # Dynamic threshold based on original values (create tensors with matching dtype/device)
+        zero_tol = torch.full_like(original, 0.05)
+        thresh_factor = torch.as_tensor(threshold_factor, dtype=original.dtype, device=original.device)
         threshold = torch.where(
-            original == 0, 
-            0.05,  # Small threshold for zero values
-            threshold_factor * torch.abs(original)  # Proportional threshold for non-zero
+            original == 0,
+            zero_tol,
+            thresh_factor * torch.abs(original)
         )
-        
+
         # Calculate accuracy
-        correct = torch.abs(reconstructed - original) < threshold
+        diff = torch.abs(reconstructed - original)
+        correct = diff < threshold
         accuracy = correct.float().mean().item()
     
     return accuracy
