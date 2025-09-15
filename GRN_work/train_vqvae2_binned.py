@@ -30,7 +30,7 @@ class Config:
     out_dir: str = "vqvae2_binned_results"
     num_bins: int = 5
     batch_size: int = 64
-    epochs: int = 200
+    epochs: int = 1000
     lr: float = 5e-3
     vq_beta: float = 0.25
     codebook_size: int = 1024
