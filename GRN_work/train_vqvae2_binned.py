@@ -1,6 +1,7 @@
 import os
 import math
 import json
+import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -8,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 from datetime import datetime
 from typing import Dict, Tuple
 
-from src.model.MehransModels.vqvae2 import (
+from src.model.vqvae2_mutable import (
     VQAutoDecoder,
     WeightedHybridLoss,
     VectorQuantizer,
@@ -44,6 +45,19 @@ class Config:
     num_workers: int = 4
 
 CFG = Config()
+
+# ------------------------------
+# CLI
+# ------------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train VQAutoDecoder with binned evaluation metrics.")
+    parser.add_argument("--data-file", dest="data_file", type=str, default=CFG.data_file,
+                        help="Path to expression matrix .npz (cells x genes). Overrides GENE_EXPR_FILE env var.")
+    parser.add_argument("--out-dir", dest="out_dir", type=str, default=CFG.out_dir,
+                        help="Directory to write training artifacts.")
+    parser.add_argument("--num-bins", dest="num_bins", type=int, default=CFG.num_bins,
+                        help="Number of non-zero bins (zero is implicit).")
+    return parser.parse_args()
 
 # ------------------------------
 # Utilities for binning metrics
@@ -254,6 +268,18 @@ def train():
     print('Training complete. Artifacts saved in', CFG.out_dir)
 
 if __name__ == '__main__':
+    args = parse_args()
+    # Apply CLI overrides
+    CFG.data_file = args.data_file
+    CFG.out_dir = args.out_dir
+    CFG.num_bins = args.num_bins
+    if CFG.num_bins < 1:
+        raise ValueError("--num-bins must be >= 1")
+    if not os.path.isfile(CFG.data_file):
+        raise FileNotFoundError(f"Data file not found: {CFG.data_file}")
     reserve_mem_all_gpus(TARGET_FRACTION)
     torch.backends.cudnn.benchmark = True
+    print(f"Using data file: {CFG.data_file}")
+    print(f"Output directory: {CFG.out_dir}")
+    print(f"Number of bins (non-zero): {CFG.num_bins}")
     train()
