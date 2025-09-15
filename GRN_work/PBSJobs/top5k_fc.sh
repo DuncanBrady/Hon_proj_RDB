@@ -12,6 +12,6 @@
 module load python/3.9.2
 module load pytorch/1.10.0
 source  /home/561/rb6232/code_base/Hon_proj_RDB/.venv/bin/activate
-python3 train_simple_autoencoder.py --data_path /g/data/yr31/rb6232/sct_top5k.npz --num_bins 7 --track_epoch_confusion
+python3 /home/561/rb6232/code_base/Hon_proj_RDB/GRN_WORK/train_simple_autoencoder.py --data_path /g/data/yr31/rb6232/sct_top5k.npz --num_bins 7 --track_epoch_confusion
 
 
