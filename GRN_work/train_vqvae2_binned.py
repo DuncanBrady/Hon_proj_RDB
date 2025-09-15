@@ -26,7 +26,7 @@ from src.preprocess.binning import term_freq_bin
 # Config
 # ------------------------------
 class Config:
-    data_file: str = os.environ.get("GENE_EXPR_FILE", "C:/Users/rdbra/Documents/honoursProject/code_base/data/sct_matrix_transposed.npz")
+    data_file: str = "data/gene_expression_matrix.npz"  # cells x genes
     out_dir: str = "vqvae2_binned_results"
     num_bins: int = 5
     batch_size: int = 64

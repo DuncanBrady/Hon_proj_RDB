@@ -25,6 +25,15 @@ from torch.utils.data import DataLoader, Dataset
 import logging
 from pathlib import Path
 import json
+from typing import Dict, Any
+
+# Optional visualization libs (only used if available)
+try:
+    import matplotlib.pyplot as plt  # type: ignore
+    import seaborn as sns  # type: ignore
+    _HAS_PLOTTING = True
+except Exception:  # pragma: no cover
+    _HAS_PLOTTING = False
 
 # Import our custom modules
 import sys
@@ -146,7 +155,100 @@ def create_results_directory(data_path, model_type="fc_autoencoder"):
     return results_dir
 
 
-def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, num_epochs, loss_function, loss_type='mse'):
+def _compute_per_bin_stats(original_batch: torch.Tensor, reconstructed_batch: torch.Tensor, num_bins: int, loss_type: str):
+    """Compute per-bin accuracy and loss for a batch.
+
+    For MSE/Huber we treat reconstruction as regression and map predictions back to nearest bin via digitization
+    using the batch's (or provided) bin edges derived from original non-zero values. For cross-entropy the model
+    output already represents class probabilities.
+
+    Returns dict with:
+      per_bin_correct, per_bin_total, per_bin_loss_sum (all length num_bins)
+    """
+    # Move to CPU for numpy operations
+    orig = original_batch.detach().cpu().numpy()
+    recon = reconstructed_batch.detach().cpu().numpy()
+
+    # Determine bin indices for original data (bins start at 0; zero values remain 0)
+    # We assume term_freq_bin produced integer bin labels 0..num_bins with 0 reserved for zeros; adjust if max == num_bins
+    # Clip to [0, num_bins]
+    orig_bins = np.clip(orig.astype(int), 0, num_bins)
+
+    if loss_type in ['cross_entropy', 'ce'] and reconstructed_batch.dim() == 3:
+        # recon shape: (batch, genes, classes) -> predicted class
+        pred_bins = reconstructed_batch.argmax(dim=2).detach().cpu().numpy()
+    else:
+        # For regression outputs, round to nearest int and clip
+        pred_bins = np.clip(np.rint(recon).astype(int), 0, num_bins)
+
+    # Per-element squared error for loss approximation (independent of weighting scheme)
+    per_elem_se = (recon - orig) ** 2
+
+    per_bin_correct = np.zeros(num_bins + 1, dtype=np.int64)
+    per_bin_total = np.zeros(num_bins + 1, dtype=np.int64)
+    per_bin_loss_sum = np.zeros(num_bins + 1, dtype=np.float64)
+
+    flat_orig = orig_bins.flatten()
+    flat_pred = pred_bins.flatten()
+    flat_loss = per_elem_se.flatten()
+
+    for b in range(num_bins + 1):
+        mask = flat_orig == b
+        if not np.any(mask):
+            continue
+        per_bin_total[b] += mask.sum()
+        per_bin_correct[b] += (flat_pred[mask] == b).sum()
+        per_bin_loss_sum[b] += flat_loss[mask].sum()
+
+    return {
+        'per_bin_correct': per_bin_correct,
+        'per_bin_total': per_bin_total,
+        'per_bin_loss_sum': per_bin_loss_sum
+    }
+
+
+def _accumulate_bin_stats(aggregate: Dict[str, np.ndarray], batch_stats: Dict[str, np.ndarray]):
+    """Accumulate batch stats into aggregate containers."""
+    if not aggregate:
+        for k, v in batch_stats.items():
+            aggregate[k] = v.copy()
+    else:
+        for k, v in batch_stats.items():
+            aggregate[k] += v
+    return aggregate
+
+
+def _finalize_bin_metrics(aggregate: Dict[str, np.ndarray]):
+    """Compute accuracy and mean loss per bin from aggregates."""
+    per_bin_accuracy = []
+    per_bin_mean_loss = []
+    for correct, total, loss_sum in zip(aggregate['per_bin_correct'], aggregate['per_bin_total'], aggregate['per_bin_loss_sum']):
+        if total == 0:
+            per_bin_accuracy.append(None)
+            per_bin_mean_loss.append(None)
+        else:
+            per_bin_accuracy.append(correct / total)
+            per_bin_mean_loss.append(loss_sum / total)
+    return per_bin_accuracy, per_bin_mean_loss
+
+
+def _generate_confusion_matrix(aggregate: Dict[str, np.ndarray], num_bins: int):
+    """Create pseudo confusion matrix using correct/total per bin where diagonal=correct and off-diagonal mass distributed uniformly among errors.
+    This is a lightweight approximation to avoid storing all predictions. For detailed matrix, final reconstruction step handles full confusion.
+    """
+    cm = np.zeros((num_bins + 1, num_bins + 1), dtype=np.int64)
+    # Only diagonal information available at epoch-level; errors allocated to 'other' bin (column 0) for visibility
+    for b in range(num_bins + 1):
+        total = aggregate['per_bin_total'][b]
+        correct = aggregate['per_bin_correct'][b]
+        if total == 0:
+            continue
+        cm[b, b] = correct
+        cm[b, 0] += (total - correct)  # lump errors into column 0
+    return cm
+
+
+def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, num_epochs, loss_function, loss_type='mse', num_bins: int = 10, track_epoch_confusion: bool = False):
     """
     Train the autoencoder model.
     
@@ -169,7 +271,10 @@ def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, n
         'epochs': [],
         'losses': [],
         'accuracies': [],
-        'learning_rates': []
+        'learning_rates': [],
+        'per_bin_accuracy': [],  # list of lists (epoch -> bin accuracy)
+        'per_bin_loss': [],      # list of lists (epoch -> bin mean loss)
+        'epoch_confusion_matrices': []  # optional approximate matrices
     }
     
     logger.info("Starting training...")
@@ -180,28 +285,34 @@ def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, n
         epoch_accuracy = 0.0
         num_batches = 0
         
+        # Aggregate per-bin stats across batches for this epoch
+        aggregate_bin_stats: Dict[str, np.ndarray] = {}
+
         for batch_data in dataloader:
             batch_data = batch_data.to(device)
-            
+
             # Forward pass
             reconstructed, latent = model(batch_data)
-            
+
             # Calculate loss
             loss = loss_function(reconstructed, batch_data)
-            
+
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
+
             # Update learning rate
             if scheduler:
                 scheduler.step()
-            
+
             # Calculate metrics
             with torch.no_grad():
                 accuracy = calculate_accuracy(reconstructed, batch_data, loss_type=loss_type)
-            
+                # Per-bin stats
+                batch_stats = _compute_per_bin_stats(batch_data, reconstructed, num_bins=num_bins, loss_type=loss_type)
+                aggregate_bin_stats = _accumulate_bin_stats(aggregate_bin_stats, batch_stats)
+
             epoch_loss += loss.item()
             epoch_accuracy += accuracy
             num_batches += 1
@@ -211,11 +322,20 @@ def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, n
         avg_accuracy = epoch_accuracy / num_batches
         current_lr = optimizer.param_groups[0]['lr']
         
+        # Finalize per-bin metrics for epoch
+        per_bin_accuracy, per_bin_mean_loss = _finalize_bin_metrics(aggregate_bin_stats)
+
         # Store history
         history['epochs'].append(epoch)
         history['losses'].append(avg_loss)
         history['accuracies'].append(avg_accuracy)
         history['learning_rates'].append(current_lr)
+        history['per_bin_accuracy'].append(per_bin_accuracy)
+        history['per_bin_loss'].append(per_bin_mean_loss)
+
+        if track_epoch_confusion:
+            cm = _generate_confusion_matrix(aggregate_bin_stats, num_bins)
+            history['epoch_confusion_matrices'].append(cm.tolist())
         
         # Log progress
         if epoch % 10 == 0 or epoch == 1:
@@ -292,6 +412,64 @@ def calculate_reconstruction_metrics(original, reconstructed, loss_type='mse'):
     return metrics
 
 
+def _save_confusion_matrix_full(original_matrix: np.ndarray, reconstructed_matrix: np.ndarray, results_dir: str, num_bins: int, loss_type: str, logger):
+    """Compute and persist full confusion matrix between original and reconstructed bins/classes."""
+    # Convert to bin labels
+    orig_bins = np.clip(original_matrix.astype(int), 0, num_bins)
+    if loss_type in ['cross_entropy', 'ce'] and reconstructed_matrix.ndim == 3:
+        pred_bins = reconstructed_matrix.argmax(axis=2)
+    else:
+        pred_bins = np.clip(np.rint(reconstructed_matrix).astype(int), 0, num_bins)
+
+    flat_orig = orig_bins.flatten()
+    flat_pred = pred_bins.flatten()
+    n_classes = num_bins + 1
+    cm = np.zeros((n_classes, n_classes), dtype=np.int64)
+    for o, p in zip(flat_orig, flat_pred):
+        cm[o, p] += 1
+
+    cm_path = os.path.join(results_dir, 'results', 'confusion_matrix.npy')
+    np.save(cm_path, cm)
+    logger.info(f"Confusion matrix saved to: {cm_path}")
+
+    # Derive per-class precision/recall/f1
+    with np.errstate(divide='ignore', invalid='ignore'):
+        tp = np.diag(cm)
+        fp = cm.sum(axis=0) - tp
+        fn = cm.sum(axis=1) - tp
+        precision = np.divide(tp, tp + fp, out=np.zeros_like(tp, dtype=float), where=(tp + fp) != 0)
+        recall = np.divide(tp, tp + fn, out=np.zeros_like(tp, dtype=float), where=(tp + fn) != 0)
+        f1 = np.divide(2 * precision * recall, precision + recall, out=np.zeros_like(tp, dtype=float), where=(precision + recall) != 0)
+    cm_metrics = {
+        'overall_accuracy': float(tp.sum() / cm.sum() if cm.sum() else 0.0),
+        'precision_per_bin': precision.tolist(),
+        'recall_per_bin': recall.tolist(),
+        'f1_per_bin': f1.tolist(),
+        'macro_precision': float(np.mean(precision) if precision.size else 0.0),
+        'macro_recall': float(np.mean(recall) if recall.size else 0.0),
+        'macro_f1': float(np.mean(f1) if f1.size else 0.0)
+    }
+    cm_metrics_path = os.path.join(results_dir, 'results', 'confusion_matrix_metrics.json')
+    with open(cm_metrics_path, 'w') as f:
+        json.dump(cm_metrics, f, indent=2)
+    logger.info(f"Confusion matrix metrics saved to: {cm_metrics_path}")
+
+    # Optional plot
+    if _HAS_PLOTTING:
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=False, cmap='Blues', cbar=True)
+        plt.title('Autoencoder Reconstruction Confusion Matrix')
+        plt.xlabel('Predicted Bin')
+        plt.ylabel('True Bin')
+        plt.tight_layout()
+        plot_path = os.path.join(results_dir, 'results', 'confusion_matrix.png')
+        plt.savefig(plot_path, dpi=300)
+        plt.close()
+        logger.info(f"Confusion matrix plot saved to: {plot_path}")
+
+    return cm, cm_metrics
+
+
 def save_results(model, history, config, results_dir, logger, dataloader=None, device=None, original_data=None):
     """Save model, training history, configuration, and reconstructed matrix."""
     
@@ -331,6 +509,21 @@ def save_results(model, history, config, results_dir, logger, dataloader=None, d
         
         # Calculate and save reconstruction metrics
         reconstruction_metrics = calculate_reconstruction_metrics(original_matrix, reconstructed_matrix, config.get('loss_type', 'mse'))
+        # Add per-bin final metrics (reuse helper)
+        num_bins = config.get('num_bins', 10)
+        # Compute per-bin stats on full dataset
+        full_stats = _compute_per_bin_stats(torch.tensor(original_matrix), torch.tensor(reconstructed_matrix), num_bins=num_bins, loss_type=config.get('loss_type', 'mse'))
+        final_per_bin_accuracy, final_per_bin_loss = _finalize_bin_metrics(full_stats)
+        reconstruction_metrics['final_per_bin_accuracy'] = final_per_bin_accuracy
+        reconstruction_metrics['final_per_bin_loss'] = final_per_bin_loss
+        # Best accuracy per bin across epochs
+        if history.get('per_bin_accuracy'):
+            per_bin_acc_arr = np.array([[a if a is not None else np.nan for a in epoch_acc] for epoch_acc in history['per_bin_accuracy']])
+            best_per_bin_accuracy = np.nanmax(per_bin_acc_arr, axis=0).tolist()
+            reconstruction_metrics['best_per_bin_accuracy'] = best_per_bin_accuracy
+        # Generate full confusion matrix on final reconstruction
+        cm, cm_metrics = _save_confusion_matrix_full(original_matrix, reconstructed_matrix, results_dir, num_bins=num_bins, loss_type=config.get('loss_type', 'mse'), logger=logger)
+        reconstruction_metrics['confusion_matrix_overall_accuracy'] = cm_metrics['overall_accuracy']
         
         metrics_path = os.path.join(results_dir, "results", "reconstruction_metrics.json")
         with open(metrics_path, 'w') as f:
@@ -390,7 +583,12 @@ def save_results(model, history, config, results_dir, logger, dataloader=None, d
         f.write(f"Best Accuracy: {max(history['accuracies']):.4f}\n")
         f.write(f"Total Parameters: {model_info['total_parameters']:,}\n")
     
-    logger.info("All results saved successfully!")
+    # Persist extended history with per-bin metrics
+    extended_history_path = os.path.join(results_dir, 'results', 'training_history_extended.json')
+    with open(extended_history_path, 'w') as f:
+        json.dump(history, f, indent=2)
+
+    logger.info("All results saved successfully with extended metrics!")
 
 
 def main():
@@ -435,6 +633,8 @@ def main():
     # Data preprocessing arguments
     parser.add_argument('--num_bins', type=int, default=10,
                        help='Number of bins for term frequency binning (default: 10)')
+    parser.add_argument('--track_epoch_confusion', action='store_true',
+                       help='Track approximate epoch-level confusion matrices (diagonal + aggregated errors)')
     
     # Other arguments
     parser.add_argument('--seed', type=int, default=42,
@@ -541,7 +741,9 @@ def main():
             logger=logger,
             num_epochs=args.epochs,
             loss_function=loss_function,
-            loss_type=args.loss_type
+            loss_type=args.loss_type,
+            num_bins=args.num_bins,
+            track_epoch_confusion=args.track_epoch_confusion
         )
         
         # Stage 3: Save results

@@ -64,7 +64,14 @@ def unwrap(m):
 # ----------------------------
 def load_expression_tensor(file_path: str) -> torch.Tensor:
     """Load expression matrix (cells x genes) .npz and return tensor shaped (genes x cells)."""
-    cell_gene = np.load(file_path)["arr_0"]  # expect (cells x genes)
+    with np.load(file_path) as npz:
+        if "data" in npz:
+            cell_gene = npz["data"]
+        elif "arr_0" in npz:
+            cell_gene = npz["arr_0"]
+        else:
+            first_key = list(npz.keys())[0]
+            cell_gene = npz[first_key]
     gene_cell = cell_gene.T.astype(np.float32)
     gene_tensor = torch.tensor(gene_cell)
     return gene_tensor
