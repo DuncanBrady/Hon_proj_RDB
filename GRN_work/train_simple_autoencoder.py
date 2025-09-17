@@ -609,9 +609,9 @@ def main():
                        help='Dropout rate (default: 0.1)')
     
     # Loss function arguments
-    parser.add_argument('--loss_type', type=str, default='mse', 
+    parser.add_argument('--loss_type', type=str, default='cross_entropy', 
                        choices=['mse', 'cross_entropy', 'huber'],
-                       help='Loss function type (default: mse)')
+                       help='Loss function type (default: cross_entropy)')
     parser.add_argument('--num_classes', type=int, default=None,
                        help='Number of classes for cross-entropy loss (auto-detected if None)')
     parser.add_argument('--zero_weight', type=float, default=0.1,
