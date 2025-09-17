@@ -2,11 +2,11 @@
 
 #PBS -P yr31
 #PBS -q gpuvolta
-#PBS -l walltime=8:00:00
-#PBS -l ncpus=24
+#PBS -l walltime=10:00:00
+#PBS -l ncpus=36
 #PBS -l mem=32GB
-#PBS -l ngpus=2
-#PBS -l jobfs=100GB
+#PBS -l ngpus=3
+#PBS -l jobfs=10GB
 #PBS -l wd
 
 module load python3/3.9.2
