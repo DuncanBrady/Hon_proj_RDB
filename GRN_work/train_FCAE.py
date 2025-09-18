@@ -168,22 +168,37 @@ def _compute_per_bin_stats(original_batch: torch.Tensor, reconstructed_batch: to
     # Move to CPU for numpy operations
     # Force float32 to avoid upcasting to float64 in older PyTorch / NumPy interactions
     orig = original_batch.detach().to(torch.float32).cpu().numpy()
-    recon = reconstructed_batch.detach().to(torch.float32).cpu().numpy()
+    # If cross-entropy: reconstructed may be (B, G, C). We'll keep tensor version for per-element loss.
+    recon_tensor = reconstructed_batch.detach().to(torch.float32)
+    recon = recon_tensor.cpu().numpy()
 
     # Determine bin indices for original data (bins start at 0; zero values remain 0)
     # We assume term_freq_bin produced integer bin labels 0..num_bins with 0 reserved for zeros; adjust if max == num_bins
     # Clip to [0, num_bins]
     orig_bins = np.clip(orig.astype(int), 0, num_bins)
 
-    if loss_type in ['cross_entropy', 'ce'] and reconstructed_batch.dim() == 3:
-        # recon shape: (batch, genes, classes) -> predicted class
-        pred_bins = reconstructed_batch.argmax(dim=2).detach().cpu().numpy()
+    is_ce = loss_type in ['cross_entropy', 'ce'] and reconstructed_batch.dim() == 3
+    if is_ce:
+        # recon shape: (batch, genes, classes) -> predicted class indices via argmax
+        pred_bins = recon_tensor.argmax(dim=2).detach().cpu().numpy()
     else:
         # For regression outputs, round to nearest int and clip
         pred_bins = np.clip(np.rint(recon).astype(int), 0, num_bins)
 
-    # Per-element squared error for loss approximation (independent of weighting scheme)
-    per_elem_se = (recon - orig) ** 2
+    # Per-element loss proxy:
+    #  - For regression style (MSE/Huber) keep squared error.
+    #  - For cross-entropy use negative log probability of the true class (NLL) so higher means worse.
+    if is_ce:
+        # recon_tensor: (B, G, C) already softmax probabilities (model applies softmax)
+        # Need true class indices from orig (integers after binning). Ensure within range.
+        true_classes = torch.clamp(original_batch.long(), 0, recon_tensor.shape[2]-1)
+        # Gather probabilities of true class
+        probs_true = torch.gather(recon_tensor, 2, true_classes.unsqueeze(-1)).squeeze(-1)
+        # Numerical stability: clamp probabilities
+        probs_true = torch.clamp(probs_true, 1e-8, 1.0)
+        per_elem_loss = (-probs_true.log()).cpu().numpy()
+    else:
+        per_elem_loss = (recon - orig) ** 2
 
     per_bin_correct = np.zeros(num_bins + 1, dtype=np.int64)
     per_bin_total = np.zeros(num_bins + 1, dtype=np.int64)
@@ -191,7 +206,7 @@ def _compute_per_bin_stats(original_batch: torch.Tensor, reconstructed_batch: to
 
     flat_orig = orig_bins.flatten()
     flat_pred = pred_bins.flatten()
-    flat_loss = per_elem_se.flatten()
+    flat_loss = per_elem_loss.flatten()
 
     for b in range(num_bins + 1):
         mask = flat_orig == b
@@ -281,6 +296,14 @@ def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, n
     logger.info("Starting training...")
     start_time = time.time()
     
+    scaler = torch.cuda.amp.GradScaler(enabled=getattr(model, 'use_amp', False))
+
+    best_loss = float('inf')
+    best_epoch = 0
+    patience = getattr(model, 'early_stopping_patience', None)
+    min_delta = getattr(model, 'early_stopping_min_delta', 0.0)
+    grad_clip = getattr(model, 'grad_clip_norm', None)
+
     for epoch in range(1, num_epochs + 1):
         epoch_loss = 0.0
         epoch_accuracy = 0.0
@@ -291,17 +314,24 @@ def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, n
 
         for batch_data in dataloader:
             batch_data = batch_data.to(device)
+            optimizer.zero_grad(set_to_none=True)
 
-            # Forward pass
-            reconstructed, latent = model(batch_data)
+            with torch.cuda.amp.autocast(enabled=getattr(model, 'use_amp', False)):
+                reconstructed, latent = model(batch_data)
+                loss = loss_function(reconstructed, batch_data)
 
-            # Calculate loss
-            loss = loss_function(reconstructed, batch_data)
-
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if getattr(model, 'use_amp', False):
+                scaler.scale(loss).backward()
+                if grad_clip is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
 
             # Update learning rate
             if scheduler:
@@ -318,9 +348,8 @@ def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, n
             epoch_accuracy += accuracy
             num_batches += 1
         
-        # Calculate averages
-        avg_loss = epoch_loss / num_batches
-        avg_accuracy = epoch_accuracy / num_batches
+        avg_loss = epoch_loss / max(1, num_batches)
+        avg_accuracy = epoch_accuracy / max(1, num_batches)
         current_lr = optimizer.param_groups[0]['lr']
         
         # Finalize per-bin metrics for epoch
@@ -342,12 +371,18 @@ def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, n
         if epoch % 10 == 0 or epoch == 1:
             elapsed_time = time.time() - start_time
             eta = elapsed_time * (num_epochs - epoch) / epoch if epoch > 0 else 0
-            
-            logger.info(f"Epoch {epoch:4d}/{num_epochs} | "
-                       f"Loss: {avg_loss:.6f} | "
-                       f"Accuracy: {avg_accuracy:.4f} | "
-                       f"LR: {current_lr:.2e} | "
-                       f"ETA: {eta/60:.1f}m")
+            improvement = best_loss - avg_loss
+            logger.info(f"Epoch {epoch:4d}/{num_epochs} | Loss: {avg_loss:.6f} (best {best_loss:.6f}) | "
+                        f"Δbest: {improvement:.6f} | Acc: {avg_accuracy:.4f} | LR: {current_lr:.2e} | ETA: {eta/60:.1f}m")
+
+        # Early stopping check
+        if avg_loss + min_delta < best_loss:
+            best_loss = avg_loss
+            best_epoch = epoch
+        elif patience is not None and (epoch - best_epoch) >= patience:
+            logger.info(f"Early stopping at epoch {epoch} (best epoch {best_epoch}, best loss {best_loss:.6f})")
+            # Exit training loop
+            break
     
     total_time = time.time() - start_time
     logger.info(f"Training completed in {total_time/60:.1f} minutes")
@@ -367,32 +402,45 @@ def calculate_reconstruction_metrics(original, reconstructed, loss_type='mse'):
     Returns:
         dict: Dictionary containing various reconstruction metrics
     """
-    # Basic regression metrics
-    mse = np.mean((original - reconstructed) ** 2)
-    mae = np.mean(np.abs(original - reconstructed))
+    # If cross-entropy with 3D reconstructed probs: reduce to class indices for metric compatibility
+    recon_is_probs = loss_type == 'cross_entropy' and reconstructed.ndim == 3
+    if recon_is_probs:
+        # reconstructed: (cells, genes, classes)
+        pred_class_matrix = reconstructed.argmax(axis=2)
+        # For original, we expect integer class labels (cells, genes)
+        original_classes_matrix = original if original.ndim == 2 else original.argmax(axis=2)
+        # For regression-style metrics we compare integer labels to predicted labels
+        diff_numeric = (original_classes_matrix - pred_class_matrix).astype(float)
+        mse = float(np.mean(diff_numeric ** 2))
+        mae = float(np.mean(np.abs(diff_numeric)))
+    else:
+        mse = float(np.mean((original - reconstructed) ** 2))
+        mae = float(np.mean(np.abs(original - reconstructed)))
     
     # R² score
-    ss_res = np.sum((original - reconstructed) ** 2)
-    ss_tot = np.sum((original - np.mean(original)) ** 2)
+    if recon_is_probs:
+        ss_res = float(np.sum(diff_numeric ** 2))
+        ss_tot = float(np.sum((original_classes_matrix - np.mean(original_classes_matrix)) ** 2))
+    else:
+        ss_res = float(np.sum((original - reconstructed) ** 2))
+        ss_tot = float(np.sum((original - np.mean(original)) ** 2))
     r2_score = 1 - (ss_res / (ss_tot + 1e-8))
     
     # Accuracy based on loss type
     if loss_type == 'cross_entropy':
-        # For cross-entropy, compare argmax predictions
-        original_classes = np.argmax(original, axis=1) if original.ndim > 1 and original.shape[1] > 1 else original.round().astype(int)
-        reconstructed_classes = np.argmax(reconstructed, axis=1) if reconstructed.ndim > 1 and reconstructed.shape[1] > 1 else reconstructed.round().astype(int)
-        class_accuracy = np.mean(original_classes == reconstructed_classes)
-        
-        # Use a threshold for "close enough" predictions
-        threshold = 0.1  # 10% tolerance
-        accuracy = np.mean(np.abs(original - reconstructed) < threshold)
-        
+        if recon_is_probs:
+            original_classes = original_classes_matrix.astype(int)
+            reconstructed_classes = pred_class_matrix.astype(int)
+        else:
+            # Fallback: treat arrays as already class-index matrices / vectors
+            original_classes = original.round().astype(int)
+            reconstructed_classes = reconstructed.round().astype(int)
+        class_accuracy = float(np.mean(original_classes == reconstructed_classes))
         metrics = {
-            'mse': float(mse),
-            'mae': float(mae),
+            'mse': mse,
+            'mae': mae,
             'r2_score': float(r2_score),
-            'accuracy': float(accuracy),
-            'class_accuracy': float(class_accuracy)
+            'class_accuracy': class_accuracy
         }
     else:
         # For MSE/Huber, use relative tolerance
@@ -404,8 +452,8 @@ def calculate_reconstruction_metrics(original, reconstructed, loss_type='mse'):
         accuracy = np.mean(np.abs(original - reconstructed) <= tolerance)
         
         metrics = {
-            'mse': float(mse),
-            'mae': float(mae),
+            'mse': mse,
+            'mae': mae,
             'r2_score': float(r2_score),
             'accuracy': float(accuracy)
         }
@@ -491,9 +539,16 @@ def save_results(model, history, config, results_dir, logger, dataloader=None, d
             for batch_data in dataloader:
                 batch_data = batch_data.to(device)
                 reconstructed, _ = model(batch_data)
-                
                 all_original.append(batch_data.cpu().numpy())
-                all_reconstructed.append(reconstructed.cpu().numpy())
+                if config.get('loss_type') in ['cross_entropy','ce'] and not config.get('save_full_reconstruction', False):
+                    # Store only predicted class indices to save memory
+                    if reconstructed.dim() == 3:
+                        preds = reconstructed.argmax(dim=2).cpu().numpy().astype(np.int16)
+                    else:
+                        preds = reconstructed.round().clamp(min=0).cpu().numpy().astype(np.int16)
+                    all_reconstructed.append(preds)
+                else:
+                    all_reconstructed.append(reconstructed.cpu().numpy())
         
         # Concatenate all batches
         original_matrix = np.concatenate(all_original, axis=0)
@@ -501,12 +556,20 @@ def save_results(model, history, config, results_dir, logger, dataloader=None, d
         
         # Save original and reconstructed data
         reconstruction_path = os.path.join(results_dir, "results", "reconstruction_data.npz")
-        np.savez_compressed(
-            reconstruction_path,
-            original=original_matrix,
-            reconstructed=reconstructed_matrix
-        )
-        logger.info(f"Reconstruction matrices saved to: {reconstruction_path}")
+        try:
+            np.savez_compressed(
+                reconstruction_path,
+                original=original_matrix,
+                reconstructed=reconstructed_matrix
+            )
+            logger.info(f"Reconstruction data saved to: {reconstruction_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save full reconstruction ({e}); saving lightweight version.")
+            np.savez_compressed(
+                reconstruction_path,
+                original_shape=original_matrix.shape,
+                reconstructed_shape=reconstructed_matrix.shape
+            )
         
         # Calculate and save reconstruction metrics
         reconstruction_metrics = calculate_reconstruction_metrics(original_matrix, reconstructed_matrix, config.get('loss_type', 'mse'))
@@ -630,6 +693,15 @@ def main():
                        help='Initial learning rate (default: 1e-3)')
     parser.add_argument('--weight_decay', type=float, default=1e-5,
                        help='Weight decay for optimizer (default: 1e-5)')
+    parser.add_argument('--early_stopping_patience', type=int, default=50,
+                       help='Patience for early stopping (default: 50; disable with 0)')
+    parser.add_argument('--early_stopping_min_delta', type=float, default=1e-5,
+                       help='Minimum loss improvement to reset patience (default: 1e-5)')
+    parser.add_argument('--grad_clip_norm', type=float, default=1.0,
+                       help='Gradient clipping max norm (default: 1.0; disable with <=0)')
+    parser.add_argument('--amp', action='store_true', help='Enable mixed precision training (AMP)')
+    parser.add_argument('--auto_class_weights', action='store_true', help='Automatically compute inverse-frequency class weights for cross-entropy')
+    parser.add_argument('--save_full_reconstruction', action='store_true', help='If set, save full reconstructed tensor (probabilities/logits). Default is to save only argmax class indices for CE to reduce memory.')
     
     # Data preprocessing arguments
     parser.add_argument('--num_bins', type=int, default=10,
@@ -675,23 +747,23 @@ def main():
     try:
         # Stage 1: Load and preprocess data
         gene_expression_data = load_and_preprocess_data(args.data_path, args.num_bins, logger)
-        
+
         # Create dataset and dataloader
         dataset = GeneExpressionDataset(gene_expression_data)
         dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
-        
+
         # Stage 2: Create and train model
         input_dim = gene_expression_data.shape[1]  # Number of genes
-        
-        # Determine model configuration based on loss type
-        output_activation = 'softmax' if args.loss_type == 'cross_entropy' else 'none'
+
+        # Determine model configuration based on loss type (model now outputs logits; no softmax)
+        output_activation = 'none'
         num_classes = args.num_classes
-        
+
         # Auto-detect number of classes for cross-entropy if not specified
         if args.loss_type == 'cross_entropy' and num_classes is None:
             num_classes = int(gene_expression_data.max()) + 1
             logger.info(f"Auto-detected number of classes: {num_classes}")
-        
+
         model = SimpleAutoencoder(
             input_dim=input_dim,
             hidden_dims=args.hidden_dims,
@@ -700,28 +772,44 @@ def main():
             output_activation=output_activation,
             num_classes=num_classes
         )
-        
         model = model.to(device)
-        
+
+        # Attach training control attributes
+        model.use_amp = bool(args.amp and device.type == 'cuda')
+        model.early_stopping_patience = None if args.early_stopping_patience <= 0 else args.early_stopping_patience
+        model.early_stopping_min_delta = args.early_stopping_min_delta
+        model.grad_clip_norm = None if args.grad_clip_norm is None or args.grad_clip_norm <= 0 else args.grad_clip_norm
+
+        # Compute class weights if requested and cross-entropy
+        class_weights = None
+        if args.loss_type == 'cross_entropy' and args.auto_class_weights:
+            flat = torch.tensor(gene_expression_data, dtype=torch.long).view(-1)
+            counts = torch.bincount(flat, minlength=num_classes).float()
+            freq = counts / counts.sum().clamp_min(1)
+            inv = 1.0 / freq.clamp_min(1e-8)
+            class_weights = inv / inv.sum() * num_classes  # normalize
+            logger.info(f"Computed class weights: {class_weights.tolist()}")
+
         # Create loss function
         loss_function = get_loss_function(
             loss_type=args.loss_type,
             num_classes=num_classes,
             zero_weight=args.zero_weight,
             nonzero_weight=args.nonzero_weight,
-            delta=args.huber_delta
+            delta=args.huber_delta,
+            class_weights=class_weights
         )
-        
+
         logger.info(f"Using {args.loss_type} loss function")
         if args.loss_type == 'cross_entropy':
             logger.info(f"Number of classes: {num_classes}")
-        
+
         # Print model summary
         model_summary(model, (args.batch_size, input_dim))
-        
+
         # Setup optimizer and scheduler
         optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-        
+
         # Use OneCycleLR scheduler
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -731,7 +819,7 @@ def main():
             pct_start=0.1,
             anneal_strategy='cos'
         )
-        
+
         # Train the model
         history = train_autoencoder(
             dataloader=dataloader,
@@ -746,12 +834,12 @@ def main():
             num_bins=args.num_bins,
             track_epoch_confusion=args.track_epoch_confusion
         )
-        
+
         # Stage 3: Save results
         save_results(model, history, config, results_dir, logger, dataloader, device, gene_expression_data)
-        
+
         logger.info("Training completed successfully!")
-        
+
     except Exception as e:
         logger.error(f"Training failed with error: {e}")
         raise

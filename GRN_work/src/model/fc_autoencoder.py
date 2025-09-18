@@ -7,6 +7,7 @@ designed for reconstructing gene expression matrices.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 
@@ -69,20 +70,15 @@ class SimpleAutoencoder(nn.Module):
             current_dim = hidden_dim
         
         # Final decoder layer to output space
-        if num_classes is not None and output_activation == 'softmax':
-            # For classification: output logits for each gene and each class
+        if num_classes is not None:
+            # For classification: output raw logits (no softmax here; apply in loss/metrics if needed)
             decoder_layers.append(nn.Linear(current_dim, input_dim * num_classes))
         else:
-            # For regression: output single value per gene
             decoder_layers.append(nn.Linear(current_dim, input_dim))
-            
-        # Add output activation if specified
-        if output_activation == 'relu':
+
+        # Only apply ReLU for explicit 'relu'; ignore 'softmax' here to keep logits
+        if output_activation == 'relu' and num_classes is None:
             decoder_layers.append(nn.ReLU())
-        elif output_activation == 'softmax':
-            # Softmax will be applied per gene in the forward pass
-            pass
-        # For 'none', no activation is added
         
         self.decoder = nn.Sequential(*decoder_layers)
         
@@ -110,12 +106,10 @@ class SimpleAutoencoder(nn.Module):
         decoded = self.decoder(latent)
         
         # Handle different output formats
-        if self.num_classes is not None and self.output_activation == 'softmax':
-            # Reshape to (batch_size, input_dim, num_classes) and apply softmax
+        if self.num_classes is not None:
+            # Reshape to (batch_size, input_dim, num_classes). Keep as raw logits.
             batch_size = decoded.shape[0]
             decoded = decoded.view(batch_size, self.input_dim, self.num_classes)
-            # Apply softmax over the class dimension for each gene
-            decoded = torch.softmax(decoded, dim=2)
         
         return decoded, latent
     
@@ -128,12 +122,9 @@ class SimpleAutoencoder(nn.Module):
         decoded = self.decoder(latent)
         
         # Handle different output formats
-        if self.num_classes is not None and self.output_activation == 'softmax':
-            # Reshape to (batch_size, input_dim, num_classes) and apply softmax
+        if self.num_classes is not None:
             batch_size = decoded.shape[0]
             decoded = decoded.view(batch_size, self.input_dim, self.num_classes)
-            # Apply softmax over the class dimension for each gene
-            decoded = torch.softmax(decoded, dim=2)
         
         return decoded
 
@@ -161,7 +152,7 @@ def weighted_mse_loss(reconstructed, original, zero_weight=0.1, nonzero_weight=1
     return torch.mean(weighted_mse)
 
 
-def cross_entropy_reconstruction_loss(reconstructed, original, num_classes=None, zero_weight=0.1, nonzero_weight=1.0):
+def cross_entropy_reconstruction_loss(reconstructed, original, num_classes=None, zero_weight=0.1, nonzero_weight=1.0, class_weights=None):
     """
     Cross-entropy reconstruction loss for discretized gene expression data.
     
@@ -184,13 +175,13 @@ def cross_entropy_reconstruction_loss(reconstructed, original, num_classes=None,
     if num_classes is None:
         num_classes = int(original.max().item()) + 1
     
-    # If reconstructed is 2D, we need to reshape it to 3D for cross-entropy
+    # Expect reconstructed as logits (batch, genes, classes) or (batch, genes)
     if reconstructed.dim() == 2:
+        # Expand single value per gene into identical logits across classes (degenerate)
         batch_size, num_genes = reconstructed.shape
-        # Reshape to (batch_size, num_classes, num_genes) for cross-entropy
         reconstructed = reconstructed.view(batch_size, num_genes, 1).expand(batch_size, num_genes, num_classes)
-    
-    # Ensure original is long tensor for cross-entropy
+
+    # Ensure original is long tensor
     original = original.long()
     
     # Create weight mask based on zero/non-zero values
@@ -201,24 +192,22 @@ def cross_entropy_reconstruction_loss(reconstructed, original, num_classes=None,
     batch_size, num_genes = original.shape
     
     if reconstructed.dim() == 3:
-        # reconstructed: (batch_size, num_genes, num_classes)
         reconstructed_flat = reconstructed.view(batch_size * num_genes, num_classes)
     else:
-        # If still 2D, create logits assuming linear output
         reconstructed_flat = reconstructed.view(batch_size * num_genes, -1)
         if reconstructed_flat.shape[1] != num_classes:
-            # Create one-hot-like logits
-            logits = torch.zeros(batch_size * num_genes, num_classes, device=reconstructed.device)
-            # Use reconstructed values as logits for the predicted class
-            pred_classes = torch.clamp(reconstructed.view(-1).long(), 0, num_classes - 1)
-            logits.scatter_(1, pred_classes.unsqueeze(1), reconstructed.view(-1).unsqueeze(1))
-            reconstructed_flat = logits
+            # Fallback expansion
+            reconstructed_flat = reconstructed_flat.expand(batch_size * num_genes, num_classes)
     
     original_flat = original.view(batch_size * num_genes)
     weight_flat = weight_mask.view(batch_size * num_genes)
     
     # Calculate cross-entropy loss
-    ce_loss = nn.functional.cross_entropy(reconstructed_flat, original_flat, reduction='none')
+    weight_vec = None
+    if class_weights is not None:
+        # class_weights expected as 1D tensor length num_classes
+        weight_vec = class_weights.to(reconstructed_flat.device, dtype=reconstructed_flat.dtype)
+    ce_loss = F.cross_entropy(reconstructed_flat, original_flat, weight=weight_vec, reduction='none')
     
     # Apply weights
     weighted_ce_loss = ce_loss * weight_flat
@@ -278,8 +267,9 @@ def get_loss_function(loss_type='mse', **kwargs):
         num_classes = kwargs.get('num_classes', None)
         zero_weight = kwargs.get('zero_weight', 0.1)
         nonzero_weight = kwargs.get('nonzero_weight', 1.0)
+        class_weights = kwargs.get('class_weights', None)
         return lambda reconstructed, original: cross_entropy_reconstruction_loss(
-            reconstructed, original, num_classes, zero_weight, nonzero_weight
+            reconstructed, original, num_classes, zero_weight, nonzero_weight, class_weights
         )
     
     elif loss_type.lower() == 'huber':
@@ -312,12 +302,10 @@ def calculate_accuracy(reconstructed, original, threshold_factor=0.1, loss_type=
         original = original.to(reconstructed.dtype)
 
     if loss_type.lower() in ['cross_entropy', 'ce']:
-        # For cross-entropy, calculate classification accuracy
+        # Reconstructed expected as logits (batch, genes, classes) now
         if reconstructed.dim() == 3:
-            # If reconstructed has shape (batch, genes, classes), get predicted classes
-            predicted_classes = torch.argmax(reconstructed, dim=2)
+            predicted_classes = reconstructed.argmax(dim=2)
         else:
-            # If reconstructed is 2D, round to nearest integer as predicted class
             predicted_classes = torch.round(torch.clamp(reconstructed, 0, None))
         
         # Ensure original is the same type for comparison
