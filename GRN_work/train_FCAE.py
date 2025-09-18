@@ -264,6 +264,24 @@ def _generate_confusion_matrix(aggregate: Dict[str, np.ndarray], num_bins: int):
     return cm
 
 
+def _compute_binary_accuracy(original_batch: torch.Tensor, reconstructed_batch: torch.Tensor, loss_type: str, zero_threshold: float) -> float:
+    """Compute binary accuracy (zero vs non-zero) for a batch.
+
+    cross_entropy: treat class 0 as zero, others as non-zero (uses argmax over class dim if present).
+    mse/huber: threshold both original and reconstructed using zero_threshold.
+    """
+    with torch.no_grad():
+        if loss_type in ['cross_entropy', 'ce'] and reconstructed_batch.dim() == 3:
+            preds = reconstructed_batch.argmax(dim=2)
+            true = original_batch.long().clamp_min(0)
+            pred_zero = preds.eq(0)
+            true_zero = true.eq(0)
+        else:
+            pred_zero = reconstructed_batch <= zero_threshold
+            true_zero = original_batch <= zero_threshold
+        return (pred_zero == true_zero).float().mean().item()
+
+
 def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, num_epochs, loss_function, loss_type='mse', num_bins: int = 10, track_epoch_confusion: bool = False):
     """
     Train the autoencoder model.
@@ -287,6 +305,7 @@ def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, n
         'epochs': [],
         'losses': [],
         'accuracies': [],
+    'binary_accuracies': [],
         'learning_rates': [],
         'per_bin_accuracy': [],  # list of lists (epoch -> bin accuracy)
         'per_bin_loss': [],      # list of lists (epoch -> bin mean loss)
@@ -304,9 +323,12 @@ def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, n
     min_delta = getattr(model, 'early_stopping_min_delta', 0.0)
     grad_clip = getattr(model, 'grad_clip_norm', None)
 
+    zero_threshold = getattr(model, 'zero_threshold', 1e-8)
+
     for epoch in range(1, num_epochs + 1):
         epoch_loss = 0.0
         epoch_accuracy = 0.0
+        epoch_binary_accuracy = 0.0
         num_batches = 0
         
         # Aggregate per-bin stats across batches for this epoch
@@ -340,18 +362,21 @@ def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, n
             # Calculate metrics
             with torch.no_grad():
                 accuracy = calculate_accuracy(reconstructed, batch_data, loss_type=loss_type)
+                binary_acc = _compute_binary_accuracy(batch_data, reconstructed, loss_type=loss_type, zero_threshold=zero_threshold)
                 # Per-bin stats
                 batch_stats = _compute_per_bin_stats(batch_data, reconstructed, num_bins=num_bins, loss_type=loss_type)
                 aggregate_bin_stats = _accumulate_bin_stats(aggregate_bin_stats, batch_stats)
 
             epoch_loss += loss.item()
             epoch_accuracy += accuracy
+            epoch_binary_accuracy += binary_acc
             num_batches += 1
         
         avg_loss = epoch_loss / max(1, num_batches)
         avg_accuracy = epoch_accuracy / max(1, num_batches)
+        avg_binary_accuracy = epoch_binary_accuracy / max(1, num_batches)
         current_lr = optimizer.param_groups[0]['lr']
-        
+
         # Finalize per-bin metrics for epoch
         per_bin_accuracy, per_bin_mean_loss = _finalize_bin_metrics(aggregate_bin_stats)
 
@@ -360,6 +385,7 @@ def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, n
         history['losses'].append(avg_loss)
         history['accuracies'].append(avg_accuracy)
         history['learning_rates'].append(current_lr)
+        history['binary_accuracies'].append(avg_binary_accuracy)
         history['per_bin_accuracy'].append(per_bin_accuracy)
         history['per_bin_loss'].append(per_bin_mean_loss)
 
@@ -373,7 +399,7 @@ def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, n
             eta = elapsed_time * (num_epochs - epoch) / epoch if epoch > 0 else 0
             improvement = best_loss - avg_loss
             logger.info(f"Epoch {epoch:4d}/{num_epochs} | Loss: {avg_loss:.6f} (best {best_loss:.6f}) | "
-                        f"Δbest: {improvement:.6f} | Acc: {avg_accuracy:.4f} | LR: {current_lr:.2e} | ETA: {eta/60:.1f}m")
+                        f"Δbest: {improvement:.6f} | Acc: {avg_accuracy:.4f} | BinAcc: {avg_binary_accuracy:.4f} | LR: {current_lr:.2e} | ETA: {eta/60:.1f}m")
 
         # Early stopping check
         if avg_loss + min_delta < best_loss:
@@ -381,7 +407,6 @@ def train_autoencoder(dataloader, model, device, optimizer, scheduler, logger, n
             best_epoch = epoch
         elif patience is not None and (epoch - best_epoch) >= patience:
             logger.info(f"Early stopping at epoch {epoch} (best epoch {best_epoch}, best loss {best_loss:.6f})")
-            # Exit training loop
             break
     
     total_time = time.time() - start_time
