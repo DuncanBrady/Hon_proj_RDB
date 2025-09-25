@@ -1,4 +1,3 @@
-import os
 import json
 import numpy as np
 import matplotlib.pyplot as plt
@@ -6,8 +5,9 @@ import seaborn as sns
 
 # Paths to results - Updated to use absolute paths as specified
 results_dirs = [
-    r'C:\Users\rdbra\Documents\honoursProject\code_base\data\fc_autoencoder_sct_matrix_transposed_results',
-    r'C:\Users\rdbra\Documents\honoursProject\code_base\data\fc_autoencoder_sct_matrix_transposed_results_20250819_025905'
+    r'C:\Users\rdbra\Documents\honoursProject\code_base\Hon_proj_RDB\GRN_work\results\fullData_FC_17_09',
+    r'C:\Users\rdbra\Documents\honoursProject\code_base\Hon_proj_RDB\GRN_work\results\fc_autoencoder_sct_matrix_transposed_results',
+    r'C:\Users\rdbra\Documents\honoursProject\code_base\Hon_proj_RDB\GRN_work\results\fc_autoencoder_sct_matrix_transposed_results_20250819_025905'
 ]
 
 # Helper to plot training history
