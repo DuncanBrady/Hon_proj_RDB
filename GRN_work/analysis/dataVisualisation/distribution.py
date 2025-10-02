@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-def plot_overall_hist(data, labels={"title": "Overall Data Distribution", "xlabel": "Value", "ylabel": "Count"}, num_bins=100):
+def plot_overall_hist(data, labels={"title": "Overall Data Distribution", "xlabel": "Value", "ylabel": "Count"}, num_bins=100, log_scale=False/s):
     # Plots the distribution of the entire datasets values
     min_val = np.min(data)
     max_val = np.max(data)
@@ -18,7 +18,8 @@ def plot_overall_hist(data, labels={"title": "Overall Data Distribution", "xlabe
     ax1.set_title(labels.get("title"), fontsize=16)
     ax1.set_xlabel(labels.get("xlabel"), fontsize=14)
     ax1.set_ylabel(labels.get("ylabel"), fontsize=14)
-    ax1.set_yscale('log')  # log scale for y-axis
+    if log_scale:
+        ax1.set_yscale('log')  # log scale for y-axis
     ax1.grid(alpha=0.75) 
     # add vertical lines for mean and median
     ax1.axvline(mean_val, color='red', linestyle='dashed', linewidth=1, label=f'Mean: {mean_val:.2f}')
@@ -28,9 +29,15 @@ def plot_overall_hist(data, labels={"title": "Overall Data Distribution", "xlabe
     ax1.axvline(max_val, color='purple', linestyle='dashed', linewidth=1, label=f'Max: {max_val:.2f}')
     ax1.legend()
 
-    ## Add annotations for mean, median, min, max
-    fig.status_text = f'Mean: {mean_val:.2f}\nMedian: {median_val:.2f}\nMin: {min_val:.2f}\nMax: {max_val:.2f}'
-    
+    # Add annotations for mean, median, min, and max and save the plot
+    textstr = '\n'.join((
+        f'Mean: {mean_val:.2f}',
+        f'Median: {median_val:.2f}',
+        f'Min: {min_val:.2f}',
+        f'Max: {max_val:.2f}'))
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+    ax1.text(0.75, 0.95, textstr, transform=ax1.transAxes, fontsize=12, verticalalignment='top', bbox=props)            
+    plt.tight_layout()
     return fig
 
 def plot_zero_inflated_dist(data):
