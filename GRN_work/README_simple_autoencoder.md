@@ -172,6 +172,54 @@ Epoch   10/1000 | Loss: 0.045623 | Accuracy: 0.8234 | LR: 2.34e-03 | ETA: 45.2m
 Epoch   20/1000 | Loss: 0.042156 | Accuracy: 0.8456 | LR: 4.12e-03 | ETA: 44.1m
 ```
 
+## Extended Reconstruction Metrics (Per-Bin Analysis)
+
+The training pipeline now produces detailed, bin-level metrics to help you diagnose where reconstruction succeeds or fails. These are especially useful when using binned gene expression data.
+
+Generated artifacts (in `results/`):
+
+| File | Description |
+|------|-------------|
+| `training_history_extended.json` | Includes per-epoch `per_bin_accuracy`, `per_bin_loss`, and optional approximate epoch confusion matrices |
+| `reconstruction_metrics.json` | Adds `final_per_bin_accuracy`, `final_per_bin_loss`, and `best_per_bin_accuracy` across epochs |
+| `confusion_matrix.npy` | Full confusion matrix (rows=true bins, cols=predicted bins) |
+| `confusion_matrix_metrics.json` | Overall / per-bin precision, recall, F1, macro scores |
+| `confusion_matrix.png` | Heatmap (if matplotlib + seaborn installed) |
+
+### Per-Bin Metrics Definitions
+* Per-bin accuracy: fraction of elements from a true bin that were reconstructed (rounded / argmax) into the same bin.
+* Per-bin loss: mean squared error of elements belonging to that bin (independent of weighting used in the training loss for interpretability).
+* Best per-bin accuracy: maximum accuracy achieved for each bin over all epochs (helps identify under-fit bins).
+
+### Confusion Matrix
+The final confusion matrix is computed on the full reconstructed dataset. For cross-entropy models it uses argmax over class probabilities; for MSE/Huber it rounds predictions to nearest integer bin.
+
+### Optional Epoch-Level Confusion Tracking
+Use `--track_epoch_confusion` to store lightweight approximate confusion matrices per epoch (diagonal + aggregated errors). This keeps memory usage low while enabling temporal evolution analysis.
+
+### Enabling Features
+Add the flag during training:
+```bash
+python train_simple_autoencoder.py --data_path data.npz --num_bins 10 --track_epoch_confusion
+```
+
+### Plotting Dependencies
+Install plotting extras (already added to `requirements_simple_autoencoder.txt`):
+```
+pip install matplotlib seaborn
+```
+
+### Programmatic Access Example
+```python
+import json, numpy as np
+hist = json.load(open('results/training_history_extended.json'))
+final_per_bin_acc = json.load(open('results/reconstruction_metrics.json'))['final_per_bin_accuracy']
+cm = np.load('results/confusion_matrix.npy')
+```
+
+These metrics make it straightforward to: (1) detect bins with systematic under-performance, (2) compare reconstruction fidelity across expression intensity levels, and (3) guide re-weighting or architectural adjustments.
+
+
 ## Model Loading and Inference
 
 To load a trained model for inference:
