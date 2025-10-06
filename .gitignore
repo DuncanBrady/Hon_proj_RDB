@@ -129,6 +129,9 @@ ENV/
 env.bak/
 venv.bak/
 
+#PBS job scripts
+
+*/PBSJobs/*
 # Spyder project settings
 .spyderproject
 .spyproject
