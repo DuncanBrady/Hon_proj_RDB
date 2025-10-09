@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-def plot_overall_hist(data, labels={"title": "Overall Data Distribution", "xlabel": "Value", "ylabel": "Count"}, num_bins=100, log_scale=False/s):
+def plot_hist(data, labels={"title": "Overall Data Distribution", "xlabel": "Value", "ylabel": "Count"}, num_bins=100, log_scale=False):
     # Plots the distribution of the entire datasets values
     min_val = np.min(data)
     max_val = np.max(data)
@@ -40,20 +40,41 @@ def plot_overall_hist(data, labels={"title": "Overall Data Distribution", "xlabe
     plt.tight_layout()
     return fig
 
-def plot_zero_inflated_dist(data):
-    pass   
+def plot_zero_inflated_dist(data, labels = {"title": "Percentage of Zero Values", "xlabel": "Value", "ylabel": "Count"}):
+    non_zero_data  = data[data != 0]
+    zero_count = data.size - non_zero_data.size
+    zero_percentage = (zero_count / data.size) * 100
+    non_zero_percentage = 100 - zero_percentage
+    labels = ["Non-zero values", "Zero values"]
+    sizes = [non_zero_percentage, zero_percentage]
+    fig = plt.figure(figsize=(8, 6))
+    plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, colors=['lightblue', 'lightcoral'])
+    plt.title("Proportion of Zero vs Non-Zero Values in Dataset", fontsize=16)
+    return fig
 
 def plot_non_zero_dist(data):
-    # isolate the non-zero values and plot their distribution
-    non_zero_data = data[data != 0]
-    plot_overall_dist(non_zero_data)
+    non_zero_data  = data[data != 0]
+    labels = {"title": "Non-Zero Data Distribution", "xlabel": "Value", "ylabel": "Count"}
+    non_zero_plot = plot_hist(non_zero_data, labels=labels)
+    return non_zero_plot
 
 
-def plot_bin_dist(data, labels):
+def plot_bin_dist(data, labels, bin_count = None):  
+    if bin_count is None:
+        print("No bin count provided, please provide a bin count")
+        bin_count = int(input("Enter bin count: "))
+        attempts = 0  
+        while not isinstance(bin_count, int) or bin_count <= 0 and attempts < 3:
+            print("Invalid input. Please enter a positive integer for bin count.")
+            bin_count = int(input("Enter bin count: ")) 
+            attempts += 1
+        if attempts == 3:
+            print("Invalid bin count, moving on with default of 7")
+            bin_count = 7
+    hist_plot = plot_hist(data, labels=labels, num_bins=bin_count)
+    return hist_plot
     pass   
+
 
 def plot_density_dist(data, labels):
     pass
-
-def violin_plot_dist(data, labels):
-    pass   
