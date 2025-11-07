@@ -40,6 +40,7 @@ def plot_hist(data, labels={"title": "Overall Data Distribution", "xlabel": "Val
     plt.tight_layout()
     return fig
 
+
 def plot_zero_inflated_dist(data, labels = {"title": "Percentage of Zero Values", "xlabel": "Value", "ylabel": "Count"}):
     non_zero_data  = data[data != 0]
     zero_count = data.size - non_zero_data.size

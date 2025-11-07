@@ -6,7 +6,7 @@ import os
 import distribution
 
 
-def parse_arguments():
+def parse_args():
     parser = argparse.ArgumentParser(description="Visualise dataset distributions and save plots.")
     parser.add_argument('--data_path', type=str, required=True, help='Path to the dataset file.')
     parser.add_argument('--output_dir', type=str, required=True, help='Directory to save the plots.')
@@ -33,9 +33,9 @@ def overlay_plot(data, methods):
     return None
 
 def main():
-    parse_args
+    args = parse_args()
     data = load_data()
-    distribution.plot_overall_distribution(None)
+    distribution.plot_hist(None)
     return 0
 
 if __name__ == "__main__":
