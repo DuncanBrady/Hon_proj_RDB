@@ -2,7 +2,7 @@
 # It is designed to be used in conjunction with the training script to preprocess data for training autoencoders.
 # All methods expect that non-zero values are not present in the data
 import numpy as np
-data = "C:/Users/rdbra/Documents/honoursProject/code_base/data/sct_matrix_transposed.npz"
+import argparse
 
 def term_freq_bin(data, num_bins):
     #Get all non-zero values from the data
@@ -36,6 +36,29 @@ def k_means_bin(data, num_bins):
 
 if __name__ == "__main__":
     # Example usage
-    data = np.load(data)['arr_0']
-    binned_data = term_freq_bin(data, num_bins=5)
-    print("Binned data (Term Frequency):", binned_data)
+    parser = argparse.ArgumentParser(description="Binning methods for data preprocessing")
+    parser.add_argument('--data', type=str, required=True, help='Path to the input data file (numpy .npz format)')
+    parser.add_argument('--num_bins', type=int, default=7, help='Number of bins to create')
+    parser.add_argument('--method', type=str, choices=['term_freq', 'k_means'], default='term_freq', help='Binning method to use')
+    parser.add_argument('--output', type=str, required=False, help='Path to save the binned data (numpy .npz format)')
+    parser.add_argument('--transpose', action='store_true', help='Whether to transpose the data matrix before binning')
+    args = parser.parse_args()  
+    data = np.load(args.data)
+    matrix_data = data['data'] if 'data' in data else data[list(data.files)[0]]
+    
+    if args.transpose: 
+        print("Transposing data matrix, shape before:", matrix_data.shape)
+        matrix_data = matrix_data.T
+        print("Shape after transpose:", matrix_data.shape)
+    binned_data = term_freq_bin(matrix_data.copy(), num_bins=5)
+    print("Binning complete.")
+    print("Original data shape:\n", matrix_data)
+    print("Binned data (Term Frequency):\n", binned_data)
+    #If output path is provided, add gene_ids and cell_ids if available
+    if args.output:
+        if 'genes' in data and 'cells' in data:
+            np.savez_compressed(args.output, data=binned_data, genes=data['genes'], cells=data['cells'])
+            print(f"Binned data saved to {args.output} with gene and cell IDs.")
+        else:
+            np.savez_compressed(args.output, data=binned_data)
+            print(f"Binned data saved to {args.output}.")
