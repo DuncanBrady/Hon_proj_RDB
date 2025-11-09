@@ -91,6 +91,8 @@ def load_data(file_path: str, bins: int = 7):
     cell_counts = len(data["cells"]) if "cells" in data.keys() else None
     print(f"Gene counts: {genes_counts}, Cell counts: {cell_counts}, Raw data shape: {sc_matrix.shape}")
     bin_matrix = term_freq_bin(sc_matrix.copy(), bins)
+    #Check the min and max of the binned matrix
+    print(f"Binned matrix min: {bin_matrix.min()}, max: {bin_matrix.max()}")
     transpose = bin_matrix.shape == (cell_counts, genes_counts) if genes_counts and cell_counts else False
     if transpose:
         print("Data in cells x genes format; transposing to genes x cells.")
@@ -450,7 +452,7 @@ if __name__ == "__main__":
     # Create result subdirectory: {dataSetName}_{epochCount}_{NumBin}_vqvae2
     subdir_name = f"{data_name}_{args.epochs}_{args.bins}_vqvae2"
     result_dir = os.path.join(args.result, subdir_name)
-    os.makedirs(result_dir, exist_ok=True)
+    os.makedirs(result_dir, exist_ok=False)
 
     # If dry-run was requested, write minimal log and exit without touching torch models
     log_path = os.path.join(result_dir, args.log_file)

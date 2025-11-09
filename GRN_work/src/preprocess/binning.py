@@ -50,7 +50,7 @@ if __name__ == "__main__":
         print("Transposing data matrix, shape before:", matrix_data.shape)
         matrix_data = matrix_data.T
         print("Shape after transpose:", matrix_data.shape)
-    binned_data = term_freq_bin(matrix_data.copy(), num_bins=5)
+    binned_data = term_freq_bin(matrix_data.copy(), num_bins=args.num_bins) if args.method == 'term_freq' else k_means_bin(matrix_data.copy(), num_bins=args.num_bins)
     print("Binning complete.")
     print("Original data shape:\n", matrix_data)
     print("Binned data (Term Frequency):\n", binned_data)

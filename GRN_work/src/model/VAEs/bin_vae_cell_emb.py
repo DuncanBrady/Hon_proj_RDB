@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class VAE_per_cell_bin(nn.Module):
+class VAE_cell_emb(nn.Module):
     """Variational Autoencoder for binned single-cell data.
 
     Decoder outputs logits per gene for each bin. The reconstruction loss
