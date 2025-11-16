@@ -128,13 +128,39 @@ def choose_cell_chunk(device: torch.device, batch_size: int, bins: int, num_cell
 # ----------------------------
 def load_data(file_path: str, bins: int = 7):
     data = np.load(file_path)
-    sc_matrix = data['data'] if 'data' in data.keys() else data[0]
+    sc_matrix = data['data'] if 'data' in data.keys() else None
+    # Support archives where arrays are stored as arr_0 or single ndarray
+    if sc_matrix is None:
+        try:
+            # try arr_0 or first file-like key
+            files = list(data.files)
+            if len(files) > 0:
+                sc_matrix = data[files[0]]
+            else:
+                sc_matrix = data
+        except Exception:
+            sc_matrix = data
+
     genes_counts = len(data["genes"]) if "genes" in data.keys() else None
     cell_counts = len(data["cells"]) if "cells" in data.keys() else None
     print(f"Gene counts: {genes_counts}, Cell counts: {cell_counts}, Raw data shape: {sc_matrix.shape}")
     bin_matrix = term_freq_bin(sc_matrix.copy(), bins)
     #Check the min and max of the binned matrix
     print(f"Binned matrix min: {bin_matrix.min()}, max: {bin_matrix.max()}")
+    # compute class weights (inverse term frequency) BEFORE converting to tensor
+    # robustly count integer bin occurrences (handles max bin > bins-1)
+    flat_bins = bin_matrix.astype(np.int64).ravel()
+    counts_full = np.bincount(flat_bins)
+    K = int(counts_full.shape[0])
+    # if caller requested more bins than present, pad counts to length `bins`
+    if bins > K:
+        pad = np.zeros(bins - K, dtype=counts_full.dtype)
+        counts_full = np.concatenate([counts_full, pad])
+    total_counts = flat_bins.size
+    # avoid zero division
+    freq = counts_full / float(total_counts) if total_counts > 0 else np.ones_like(counts_full, dtype=float)
+    inv_tf = 1.0 / (freq + 1e-8)
+
     transpose = bin_matrix.shape == (cell_counts, genes_counts) if genes_counts and cell_counts else False
     if transpose:
         print("Data in cells x genes format; transposing to genes x cells.")
@@ -144,7 +170,7 @@ def load_data(file_path: str, bins: int = 7):
     # Always return integer bin indices (0..bins-1) for binned-only model
     gene_tensor = torch.tensor(gene_cell.astype(np.int64))  # each sample is one gene row across cells (int bins)
     print(f"Expression tensor: {gene_tensor.shape} (genes x cells)")
-    return gene_tensor
+    return gene_tensor, inv_tf
     
 
 # ----------------------------
@@ -165,27 +191,65 @@ class IndexedDataset(Dataset):
 # The previous NegativeBinomial loss has been removed.
 
 
-class CrossEntropyBinnedLoss(nn.Module):
+class FocalBinnedLoss(nn.Module):
     """
-    Use cross-entropy treating each cell's binned value as a categorical class (0..K-1).
+    Focal loss for multi-class logits.
 
-    Expects recon_logits: [B, C, K] and target: [B, C] (long ints)
-    Returns (loss, ce_loss, dummy) to match existing training unpacking.
+    Expects logits shaped [N, K] and targets shaped [N] (long ints).
+    Returns either a summed or mean loss depending on reduction.
+
+    Formula: CE = cross_entropy(logits, targets, reduction='none')
+             p_t = exp(-CE)
+             FL = (1 - p_t)^gamma * CE
+             If alpha is provided (scalar), multiply FL by alpha.
     """
-    def __init__(self, eps: float = 1e-8):
+    def __init__(self, gamma: float = 2.0, alpha=None, reduction: str = 'mean'):
         super().__init__()
-        self.eps = float(eps)
+        self.gamma = float(gamma)
+        # alpha may be None, scalar float, or a 1D array/tensor of per-class weights
+        self._alpha_scalar = None
+        self.register_buffer('_alpha_tensor', None)
+        if alpha is None:
+            self._alpha_scalar = None
+        else:
+            if isinstance(alpha, torch.Tensor):
+                self.register_buffer('_alpha_tensor', alpha.detach().clone().to(torch.float32))
+            elif np is not None and isinstance(alpha, (list, tuple, np.ndarray)):
+                self.register_buffer('_alpha_tensor', torch.tensor(np.asarray(alpha, dtype=np.float32)))
+            else:
+                # scalar
+                try:
+                    self._alpha_scalar = float(alpha)
+                except Exception:
+                    self._alpha_scalar = None
+        if reduction not in ('none', 'mean', 'sum'):
+            raise ValueError("reduction must be one of 'none','mean','sum'")
+        self.reduction = reduction
 
-    def forward(self, recon_logits: torch.Tensor, target: torch.Tensor, *_):
-        # recon_logits: [B, C, K]
-        if recon_logits.dim() != 3:
-            raise ValueError("CrossEntropyBinnedLoss expects logits with shape [B, C, K]")
-        B, C, K = recon_logits.shape
-        logits = recon_logits.view(B * C, K)
-        targets = target.view(B * C).long()
-        ce = F.cross_entropy(logits, targets, reduction='mean')
-        # Return a 3-tuple to match previous unpacking (loss, recon_term, aux)
-        return ce, ce, torch.tensor(0.0, device=logits.device)
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor):
+        # logits: [N, K], targets: [N]
+        if logits.dim() != 2:
+            raise ValueError("FocalBinnedLoss expects logits with shape [N, K]")
+        ce = F.cross_entropy(logits, targets.long(), reduction='none')  # [N]
+        # p_t = exp(-CE)
+        p_t = torch.exp(-ce)
+        mod = (1.0 - p_t) ** self.gamma
+        fl = mod * ce
+        # apply alpha: scalar or per-class tensor
+        if getattr(self, '_alpha_tensor', None) is not None:
+            # index per-target alphas
+            alpha_per_sample = self._alpha_tensor[targets.long()].to(fl.device)
+            fl = fl * alpha_per_sample
+        elif self._alpha_scalar is not None:
+            fl = fl * float(self._alpha_scalar)
+
+        if self.reduction == 'sum':
+            return fl.sum(), fl.mean(), torch.tensor(0.0, device=logits.device)
+        elif self.reduction == 'mean':
+            return fl.mean(), fl.mean(), torch.tensor(0.0, device=logits.device)
+        else:
+            # return per-sample vector as primary term, and dummy second/third terms
+            return fl, fl, torch.tensor(0.0, device=logits.device)
 
 # ----------------------------
 # Simple metrics
@@ -309,7 +373,8 @@ def reconstruct_full(model: nn.Module, device: torch.device, batch_size: int = 2
 # ----------------------------
 def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autodecoder_metrics.txt",
                          init_dispersion: float = 1.0, lr: float = 0.005, bins: int = 7,
-                         checkpoint_freq: int = 50, result_dir: str = None):
+                         checkpoint_freq: int = 50, result_dir: str = None,
+                         focal_gamma: float = 2.0, focal_alpha=None):
     G, C = gene_tensor.shape
     # Model (binned-only)
     # Determine actual number of bins/classes from the loaded data to avoid target-out-of-range
@@ -333,8 +398,9 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
     )
     clip_norm = 1.0
 
-    # Loss (categorical CE over bins)
-    loss_fn = CrossEntropyBinnedLoss()
+    # Loss (categorical focal loss over bins)
+    # Use focal loss with provided gamma/alpha. alpha may be a scalar or per-class vector.
+    loss_fn = FocalBinnedLoss(gamma=float(focal_gamma), alpha=focal_alpha, reduction='sum')
     vq_weight_start, vq_weight_end, warmup_epochs = 1e-3, 1.0, int(0.25 * epochs)
     # AMP: use mixed precision on CUDA to save memory and speed up training
     use_amp = (device.type == 'cuda') and torch.cuda.is_available()
@@ -413,7 +479,10 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
                     logits_chunk = per_gene_bin_logits.unsqueeze(1) + bias_chunk.unsqueeze(0)
                     logits_flat = logits_chunk.reshape(-1, K)  # [B*chunk, K]
                     targets_chunk = x[:, start:end].reshape(-1)
-                    total_ce_sum = total_ce_sum + F.cross_entropy(logits_flat, targets_chunk.long(), reduction='sum')
+                    # compute focal loss over this flattened chunk; loss_fn returns (loss, recon_term, aux)
+                    fl_sum, _, _ = loss_fn(logits_flat, targets_chunk.long())
+                    # fl_sum is already a sum when reduction='sum'
+                    total_ce_sum = total_ce_sum + fl_sum
                     total_elems += logits_flat.size(0)
 
                 recon_loss = total_ce_sum / float(total_elems)
@@ -570,6 +639,11 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=0.005)
     parser.add_argument("--log-file", type=str, default="vqvae2_metrics.txt")
+    parser.add_argument("--class-weights", type=str, default=None,
+                        help="Path to .npy file or comma-separated list of class weights; if omitted, inverse-term-frequency weights are used by default")
+    parser.add_argument("--focal-gamma", type=float, default=2.0, help="Gamma parameter for focal loss")
+    parser.add_argument("--focal-alpha", type=str, default=None,
+                        help="Alpha for focal loss: scalar or comma-separated list / .npy path for per-class weights")
     parser.add_argument("--max-cells", type=int, default=0,
                         help="If >0, truncate each gene row to the first N cells (useful for smoke tests)")
     parser.add_argument("--device", type=str, default="auto", choices=["auto","cpu","cuda"],
@@ -609,8 +683,8 @@ if __name__ == "__main__":
         print(f"Dry-run: created result directory and log at {result_dir}")
         raise SystemExit(0)
 
-    # Load the data and prepare dataloader
-    gene_tensor = load_data(args.data, bins=args.bins)  # shape: [G, C]
+    # Load the data and prepare dataloader, request class-weights computed pre-tensor
+    gene_tensor, default_class_weights = load_data(args.data, bins=args.bins)
     print(gene_tensor.max().item(), "is the max bin value in the loaded data")
     # Optional truncation for smoke tests
     if args.max_cells and args.max_cells > 0:
@@ -620,10 +694,56 @@ if __name__ == "__main__":
     ds = IndexedDataset(gene_tensor)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.num_workers)
 
+    # parse class-weights / focal-alpha CLI args: path to .npy or comma-separated list
+    class_weights = None
+    if args.class_weights:
+        s = args.class_weights.strip()
+        if os.path.exists(s):
+            try:
+                arr = np.load(s)
+                class_weights = arr if isinstance(arr, np.ndarray) else np.array(arr)
+            except Exception:
+                with open(s, 'r') as fh:
+                    txt = fh.read().strip()
+                parts = re.split(r"[,\s]+", txt.strip('[]'))
+                class_weights = [float(p) for p in parts if p != '']
+        else:
+            parts = re.split(r"[,\s]+", s.strip('[]'))
+            class_weights = [float(p) for p in parts if p != '']
+    else:
+        # default: use inverse-term-frequency computed in load_data
+        class_weights = default_class_weights
+
+    # parse focal-alpha argument (can be scalar or per-class list/.npy)
+    focal_alpha = None
+    if args.focal_alpha is not None:
+        s = args.focal_alpha.strip()
+        if os.path.exists(s):
+            try:
+                arr = np.load(s)
+                focal_alpha = arr if isinstance(arr, np.ndarray) else np.array(arr)
+            except Exception:
+                with open(s, 'r') as fh:
+                    txt = fh.read().strip()
+                parts = re.split(r"[,\s]+", txt.strip('[]'))
+                focal_alpha = [float(p) for p in parts if p != '']
+        else:
+            # try parse as scalar or list
+            parts = re.split(r"[,\s]+", s.strip('[]'))
+            if len(parts) == 1:
+                focal_alpha = float(parts[0])
+            else:
+                focal_alpha = [float(p) for p in parts if p != '']
+
+    # if no explicit focal_alpha provided, use class_weights as per-class alpha
+    if focal_alpha is None:
+        focal_alpha = class_weights
+
     # pass full path for log file so training writes into the result dir
     model = train_vq_autodecoder(dl, device, epochs=args.epochs, log_filename=log_path,
                                  init_dispersion=args.init_dispersion, lr=args.lr, bins=args.bins,
-                                 checkpoint_freq=50, result_dir=result_dir)
+                                 checkpoint_freq=50, result_dir=result_dir,
+                                 focal_gamma=args.focal_gamma, focal_alpha=focal_alpha)
 
     # Save weights
     torch.save(model.state_dict(), os.path.join(result_dir, "vqvae2_model.pth"))

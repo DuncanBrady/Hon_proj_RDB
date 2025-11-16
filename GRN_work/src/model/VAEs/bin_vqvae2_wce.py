@@ -22,6 +22,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from torch import cuda
 import pandas as pd
 import argparse
+import re
 import sys
 try:
     import psutil
@@ -122,11 +123,22 @@ def choose_cell_chunk(device: torch.device, batch_size: int, bins: int, num_cell
     chunk = min(max_chunk, chunk)
     chunk = min(chunk, num_cells)
     return int(chunk)
+# ----------------------------
+# Data processing
+# ----------------------------
+def calculate_class_weights(binned_matrix: np.ndarray):
+    # calculate the inverse frequency of each bin across the entire matrix
+    bins, counts = np.unique(binned_matrix, return_counts=True) 
+    print(type(bins[0]), bins)
+    total_counts = binned_matrix.size
+    class_weights = np.zeros(len(bins), dtype=np.float64)
+    for bin_val, count in zip(bins, counts):
+        class_weights[int(bin_val)] = total_counts / (len(bins) * count)
+    # Normalisation of the weights
+    norm_weights = class_weights / np.sum(class_weights)
+    return norm_weights
 
-# ----------------------------
-# Load SCT-normalised expression: genes x cells (non-negative)
-# ----------------------------
-def load_data(file_path: str, bins: int = 7):
+def load_data(file_path: str, bins: int = 7, return_class_weights=False):
     data = np.load(file_path)
     sc_matrix = data['data'] if 'data' in data.keys() else data[0]
     genes_counts = len(data["genes"]) if "genes" in data.keys() else None
@@ -136,6 +148,7 @@ def load_data(file_path: str, bins: int = 7):
     #Check the min and max of the binned matrix
     print(f"Binned matrix min: {bin_matrix.min()}, max: {bin_matrix.max()}")
     transpose = bin_matrix.shape == (cell_counts, genes_counts) if genes_counts and cell_counts else False
+    class_weights = calculate_class_weights(bin_matrix) if return_class_weights else None
     if transpose:
         print("Data in cells x genes format; transposing to genes x cells.")
         gene_cell = bin_matrix.T   # shape: [G, C] 
@@ -144,7 +157,7 @@ def load_data(file_path: str, bins: int = 7):
     # Always return integer bin indices (0..bins-1) for binned-only model
     gene_tensor = torch.tensor(gene_cell.astype(np.int64))  # each sample is one gene row across cells (int bins)
     print(f"Expression tensor: {gene_tensor.shape} (genes x cells)")
-    return gene_tensor
+    return gene_tensor, class_weights
     
 
 # ----------------------------
@@ -165,27 +178,58 @@ class IndexedDataset(Dataset):
 # The previous NegativeBinomial loss has been removed.
 
 
-class CrossEntropyBinnedLoss(nn.Module):
+class WeightedCrossEntropyBinnedLoss(nn.Module):
     """
-    Use cross-entropy treating each cell's binned value as a categorical class (0..K-1).
+    Weighted cross-entropy for multi-class logits.
 
-    Expects recon_logits: [B, C, K] and target: [B, C] (long ints)
-    Returns (loss, ce_loss, dummy) to match existing training unpacking.
+    Expects logits shaped [N, K] and targets shaped [N] (long ints).
+    The `weight` argument (optional) should be an iterable or tensor of length K
+    containing per-class weights. Returns (loss, mean_loss, aux) where `loss`
+    is the reduced value according to `reduction` (sum/mean).
     """
-    def __init__(self, eps: float = 1e-8):
+    def __init__(self, weight=None, reduction: str = 'mean'):
         super().__init__()
-        self.eps = float(eps)
+        if reduction not in ('none', 'mean', 'sum'):
+            raise ValueError("reduction must be one of 'none','mean','sum'")
+        self.reduction = reduction
+        # store as tensor if provided; move to device at call time
+        if weight is None:
+            self.register_buffer('_weight', None)
+        else:
+            # If caller passed a torch Tensor, copy it safely via detach().clone()
+            # to avoid the UserWarning about constructing a tensor from a tensor.
+            if isinstance(weight, torch.Tensor):
+                w = weight.detach().clone().to(torch.float32)
+            else:
+                w = torch.tensor(np.asarray(weight), dtype=torch.float32)
+            self.register_buffer('_weight', w)
 
-    def forward(self, recon_logits: torch.Tensor, target: torch.Tensor, *_):
-        # recon_logits: [B, C, K]
-        if recon_logits.dim() != 3:
-            raise ValueError("CrossEntropyBinnedLoss expects logits with shape [B, C, K]")
-        B, C, K = recon_logits.shape
-        logits = recon_logits.view(B * C, K)
-        targets = target.view(B * C).long()
-        ce = F.cross_entropy(logits, targets, reduction='mean')
-        # Return a 3-tuple to match previous unpacking (loss, recon_term, aux)
-        return ce, ce, torch.tensor(0.0, device=logits.device)
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor):
+        # logits: [N, K], targets: [N]
+        if logits.dim() != 2:
+            raise ValueError("WeightedCrossEntropyBinnedLoss expects logits with shape [N, K]")
+        weight = None
+        if getattr(self, '_weight', None) is not None:
+            # ensure weight tensor length matches number of classes (K)
+            w = self._weight.to(logits.device)
+            K = logits.size(1)
+            if w.numel() == K:
+                weight = w
+            elif w.numel() > K:
+                # truncate if provided weight longer than logits' classes
+                weight = w[:K]
+            else:
+                # pad with ones if provided weight shorter than logits' classes
+                pad = torch.ones(K - w.numel(), dtype=w.dtype, device=w.device)
+                weight = torch.cat([w, pad], dim=0)
+
+        loss_vec = F.cross_entropy(logits, targets.long(), weight=weight, reduction='none')
+        if self.reduction == 'sum':
+            return loss_vec.sum(), loss_vec.mean(), torch.tensor(0.0, device=logits.device)
+        elif self.reduction == 'mean':
+            return loss_vec.mean(), loss_vec.mean(), torch.tensor(0.0, device=logits.device)
+        else:
+            return loss_vec, loss_vec, torch.tensor(0.0, device=logits.device)
 
 # ----------------------------
 # Simple metrics
@@ -309,7 +353,8 @@ def reconstruct_full(model: nn.Module, device: torch.device, batch_size: int = 2
 # ----------------------------
 def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autodecoder_metrics.txt",
                          init_dispersion: float = 1.0, lr: float = 0.005, bins: int = 7,
-                         checkpoint_freq: int = 50, result_dir: str = None):
+                         checkpoint_freq: int = 50, result_dir: str = None,
+                         class_weights=None, weight_mode: str = 'cap', weight_cap: float = 1e4):
     G, C = gene_tensor.shape
     # Model (binned-only)
     # Determine actual number of bins/classes from the loaded data to avoid target-out-of-range
@@ -333,8 +378,34 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
     )
     clip_norm = 1.0
 
-    # Loss (categorical CE over bins)
-    loss_fn = CrossEntropyBinnedLoss()
+    # Loss (categorical weighted CE over bins)
+    # Prefer class_weights passed in from the caller (e.g. computed by load_data).
+    # If None, we leave weight_tensor as None so the loss uses no class reweighting.
+    if class_weights is None:
+        weight_tensor = None
+    else:
+        # accept numpy array, list, or torch tensor and convert to torch tensor
+        if isinstance(class_weights, torch.Tensor):
+            weight_tensor = class_weights.clone().detach().to(torch.float32)
+        else:
+            weight_tensor = torch.tensor(np.asarray(class_weights, dtype=np.float32))
+
+    # Apply weight transform to avoid extreme gradients from very rare bins
+    if weight_tensor is not None:
+        if weight_mode == 'cap':
+            # cap very large weights
+            weight_tensor = torch.clamp(weight_tensor, max=float(weight_cap))
+            print(f"Applied weight cap: {weight_cap}")
+        elif weight_mode == 'log':
+            # compress dynamic range using log1p
+            weight_tensor = torch.log1p(weight_tensor)
+            print("Applied log1p transform to class weights")
+        else:
+            # 'none' -> leave as-is
+            pass
+
+    loss_fn = WeightedCrossEntropyBinnedLoss(weight=(weight_tensor if weight_tensor is not None else None),
+                                            reduction='sum')
     vq_weight_start, vq_weight_end, warmup_epochs = 1e-3, 1.0, int(0.25 * epochs)
     # AMP: use mixed precision on CUDA to save memory and speed up training
     use_amp = (device.type == 'cuda') and torch.cuda.is_available()
@@ -413,7 +484,9 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
                     logits_chunk = per_gene_bin_logits.unsqueeze(1) + bias_chunk.unsqueeze(0)
                     logits_flat = logits_chunk.reshape(-1, K)  # [B*chunk, K]
                     targets_chunk = x[:, start:end].reshape(-1)
-                    total_ce_sum = total_ce_sum + F.cross_entropy(logits_flat, targets_chunk.long(), reduction='sum')
+                    # compute weighted CE over this flattened chunk; loss_fn returns (reduced_loss, mean_loss, aux)
+                    wce_sum, _, _ = loss_fn(logits_flat, targets_chunk.long())
+                    total_ce_sum = total_ce_sum + wce_sum
                     total_elems += logits_flat.size(0)
 
                 recon_loss = total_ce_sum / float(total_elems)
@@ -570,6 +643,12 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=0.005)
     parser.add_argument("--log-file", type=str, default="vqvae2_metrics.txt")
+    parser.add_argument("--class-weights", type=str, default=None,
+                        help="Path to .npy file or comma-separated list of class weights; if omitted, inverse-frequency weights are used by default")
+    parser.add_argument("--weight-mode", type=str, default="cap", choices=["none","cap","log"],
+                        help="How to transform class weights to avoid extremes: 'none' leave as-is, 'cap' clamp to --weight-cap, 'log' apply log1p")
+    parser.add_argument("--weight-cap", type=float, default=1e4,
+                        help="Maximum weight when --weight-mode=cap (default 1e4)")
     parser.add_argument("--max-cells", type=int, default=0,
                         help="If >0, truncate each gene row to the first N cells (useful for smoke tests)")
     parser.add_argument("--device", type=str, default="auto", choices=["auto","cpu","cuda"],
@@ -609,8 +688,9 @@ if __name__ == "__main__":
         print(f"Dry-run: created result directory and log at {result_dir}")
         raise SystemExit(0)
 
-    # Load the data and prepare dataloader
-    gene_tensor = load_data(args.data, bins=args.bins)  # shape: [G, C]
+    # Load the data and prepare dataloader, check for class_weights arg 
+    return_class_weights = args.class_weights is None
+    gene_tensor, class_weights = load_data(args.data, bins=args.bins, return_class_weights=return_class_weights)  # shape: [G, C]
     print(gene_tensor.max().item(), "is the max bin value in the loaded data")
     # Optional truncation for smoke tests
     if args.max_cells and args.max_cells > 0:
@@ -620,10 +700,30 @@ if __name__ == "__main__":
     ds = IndexedDataset(gene_tensor)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.num_workers)
 
+    # parse class weights CLI arg: path to .npy or comma-separated list
+    if args.class_weights:
+        s = args.class_weights.strip()
+        if os.path.exists(s):
+            try:
+                arr = np.load(s)
+                class_weights = arr if isinstance(arr, np.ndarray) else np.array(arr)
+            except Exception:
+                # fallback: read text and split
+                with open(s, 'r') as fh:
+                    txt = fh.read().strip()
+                parts = re.split(r"[,\s]+", txt.strip('[]'))
+                class_weights = [float(p) for p in parts if p != '']
+        else:
+            # assume comma-separated list
+            parts = re.split(r"[,\s]+", s.strip('[]'))
+            class_weights = [float(p) for p in parts if p != '']
+
     # pass full path for log file so training writes into the result dir
     model = train_vq_autodecoder(dl, device, epochs=args.epochs, log_filename=log_path,
                                  init_dispersion=args.init_dispersion, lr=args.lr, bins=args.bins,
-                                 checkpoint_freq=50, result_dir=result_dir)
+                                 checkpoint_freq=50, result_dir=result_dir,
+                                 class_weights=class_weights,
+                                 weight_mode=args.weight_mode, weight_cap=args.weight_cap)
 
     # Save weights
     torch.save(model.state_dict(), os.path.join(result_dir, "vqvae2_model.pth"))
