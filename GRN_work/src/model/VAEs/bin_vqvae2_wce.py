@@ -128,15 +128,19 @@ def choose_cell_chunk(device: torch.device, batch_size: int, bins: int, num_cell
 # ----------------------------
 def calculate_class_weights(binned_matrix: np.ndarray):
     # calculate the inverse frequency of each bin across the entire matrix
-    bins, counts = np.unique(binned_matrix, return_counts=True) 
-    print(type(bins[0]), bins)
+    # compute inverse-frequency weights (higher weight for rare bins)
+    bins_present, counts = np.unique(binned_matrix, return_counts=True)
     total_counts = binned_matrix.size
-    class_weights = np.zeros(len(bins), dtype=np.float64)
-    for bin_val, count in zip(bins, counts):
-        class_weights[int(bin_val)] = total_counts / (len(bins) * count)
-    # Normalisation of the weights
-    norm_weights = class_weights / np.sum(class_weights)
-    return norm_weights
+    # raw inverse-frequency: proportional to 1 / freq
+    class_weights = np.zeros(int(binned_matrix.max()) + 1, dtype=np.float64)
+    for bin_val, count in zip(bins_present, counts):
+        class_weights[int(bin_val)] = float(total_counts) / float(max(1, count))
+    # scale weights so that the expected per-sample weight is ~1.0. For inverse-frequency
+    # weights `total_counts/counts`, the expectation across the empirical distribution
+    # equals the number of classes, so divide by that to keep typical loss magnitudes
+    # comparable to the unweighted cross-entropy.
+    num_classes = float(max(1, class_weights.size))
+    return class_weights / num_classes
 
 def load_data(file_path: str, bins: int = 7, return_class_weights=False):
     data = np.load(file_path)
@@ -314,7 +318,9 @@ class VQAutoDecoder(nn.Module):
 
         # Learnable per-cell per-bin biases (C x K). Small: e.g. 50k cells * 7 bins = 350k params
         # which is far smaller than a full dense output.
-        self.cell_bin_bias = nn.Parameter(torch.zeros(self._num_cells, self.bins))
+        # Initialize with tiny random noise instead of all-zeros to break symmetry and
+        # encourage the model to learn per-cell differences early (helps avoid stagnation).
+        self.cell_bin_bias = nn.Parameter(torch.randn(self._num_cells, self.bins) * 1e-2)
 
     def forward(self, gene_idx: torch.Tensor):
         # gene_idx: [B] long
@@ -464,7 +470,20 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
                 # over chunks and divide by total elements to get mean loss.
                 K = per_gene_bin_logits.size(1)
                 total_ce_sum = per_gene_bin_logits.new_zeros(())
+                total_ce_sum_weighted = per_gene_bin_logits.new_zeros(())
                 total_elems = 0
+                # Prepare a device-aware weight vector for cross-entropy (pad/truncate to K)
+                if weight_tensor is None:
+                    w_for_ce = None
+                else:
+                    w_for_ce = weight_tensor.to(per_gene_bin_logits.device)
+                    if w_for_ce.numel() == K:
+                        pass
+                    elif w_for_ce.numel() > K:
+                        w_for_ce = w_for_ce[:K]
+                    else:
+                        pad = torch.ones(K - w_for_ce.numel(), dtype=w_for_ce.dtype, device=w_for_ce.device)
+                        w_for_ce = torch.cat([w_for_ce, pad], dim=0)
                 # choose a reasonable cell chunk size (auto-tuned based on available memory)
                 num_cells = unwrap(model)._num_cells
                 bs = x.size(0)
@@ -484,12 +503,22 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
                     logits_chunk = per_gene_bin_logits.unsqueeze(1) + bias_chunk.unsqueeze(0)
                     logits_flat = logits_chunk.reshape(-1, K)  # [B*chunk, K]
                     targets_chunk = x[:, start:end].reshape(-1)
-                    # compute weighted CE over this flattened chunk; loss_fn returns (reduced_loss, mean_loss, aux)
-                    wce_sum, _, _ = loss_fn(logits_flat, targets_chunk.long())
-                    total_ce_sum = total_ce_sum + wce_sum
+                    # compute unweighted CE for the chunk (used for reporting and stable
+                    # gradient magnitudes) and also the weighted CE (if class weights
+                    # were provided). We keep both so logging shows a meaningful CE value
+                    # even when class reweighting heavily scales the loss.
+                    uw_sum = F.cross_entropy(logits_flat, targets_chunk.long(), reduction='sum')
+                    if w_for_ce is not None:
+                        w_sum = F.cross_entropy(logits_flat, targets_chunk.long(), weight=w_for_ce, reduction='sum')
+                    else:
+                        w_sum = uw_sum
+                    total_ce_sum = total_ce_sum + uw_sum
+                    total_ce_sum_weighted = total_ce_sum_weighted + w_sum
                     total_elems += logits_flat.size(0)
-
+                # recon_loss (logged as CE) is the unweighted mean CE per sample; the
+                # weighted CE (if used) is available as `weighted_ce` for diagnostics.
                 recon_loss = total_ce_sum / float(total_elems)
+                weighted_ce = total_ce_sum_weighted / float(total_elems)
                 ce_loss = recon_loss
                 vq_loss = vq_loss_vec.mean()
 
@@ -674,8 +703,9 @@ if __name__ == "__main__":
     else:
         data_name = os.path.splitext(os.path.basename(args.data))[0]
 
-    # Create result subdirectory: {dataSetName}_{epochCount}_{NumBin}_vqvae2_{timeStamp}
-    subdir_name = f"{data_name}_{args.epochs}_{args.bins}_vqvae2_{int(time.time())}"
+    # Create result subdirectory: {dataSetName}_{epochCount}_{NumBin}_vqvae2_<model>_{timeStamp}
+    # Include model identifier to make WCE results easy to find
+    subdir_name = f"{data_name}_{args.epochs}_{args.bins}_vqvae2_wce_{int(time.time())}"
     result_dir = os.path.join(args.result, subdir_name)
     os.makedirs(result_dir, exist_ok=False)
 

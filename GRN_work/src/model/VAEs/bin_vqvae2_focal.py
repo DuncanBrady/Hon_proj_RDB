@@ -160,6 +160,10 @@ def load_data(file_path: str, bins: int = 7):
     # avoid zero division
     freq = counts_full / float(total_counts) if total_counts > 0 else np.ones_like(counts_full, dtype=float)
     inv_tf = 1.0 / (freq + 1e-8)
+    # scale inverse-term-frequency so that the expected per-sample alpha ~ 1.0
+    # (divide by number of classes) to avoid huge focal alpha magnitudes
+    num_classes = float(max(1, inv_tf.size))
+    inv_tf = inv_tf / num_classes
 
     transpose = bin_matrix.shape == (cell_counts, genes_counts) if genes_counts and cell_counts else False
     if transpose:
@@ -237,8 +241,9 @@ class FocalBinnedLoss(nn.Module):
         fl = mod * ce
         # apply alpha: scalar or per-class tensor
         if getattr(self, '_alpha_tensor', None) is not None:
-            # index per-target alphas
-            alpha_per_sample = self._alpha_tensor[targets.long()].to(fl.device)
+            # Move alpha tensor to loss device first, then index with targets on same device
+            alpha_dev = self._alpha_tensor.to(fl.device)
+            alpha_per_sample = alpha_dev[targets.long().to(fl.device)]
             fl = fl * alpha_per_sample
         elif self._alpha_scalar is not None:
             fl = fl * float(self._alpha_scalar)
@@ -334,7 +339,9 @@ class VQAutoDecoder(nn.Module):
 
         # Learnable per-cell per-bin biases (C x K). Small: e.g. 50k cells * 7 bins = 350k params
         # which is far smaller than a full dense output.
-        self.cell_bin_bias = nn.Parameter(torch.zeros(self._num_cells, self.bins))
+        # Initialise with tiny random noise to break symmetry and encourage early learning
+        # of per-cell biases (helps prevent early stagnation).
+        self.cell_bin_bias = nn.Parameter(torch.randn(self._num_cells, self.bins) * 1e-2)
 
     def forward(self, gene_idx: torch.Tensor):
         # gene_idx: [B] long
@@ -419,7 +426,7 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
     fixed_orig = gene_tensor[fixed_idx].clone()                   # original rows (CPU tensor)
 
     with open(log_filename, "w") as f:
-        f.write("Epoch\tLoss\tRecon\tCE\tVQ\tAcc\tBinAcc\tAbsGrad\tPerp\tVQw\tLR\tCellChunk\n")
+        f.write("Epoch\tLoss\tRecon\tCE\tVQ\tAcc\tBinAcc\tNonZeroRec\tAbsGrad\tPerp\tVQw\tLR\tCellChunk\n")
 
     # Log AMP usage and an initial cell_chunk suggestion so it's recorded in the run log
     bs = getattr(dataloader, 'batch_size', 1) or 1
@@ -435,7 +442,7 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_cell_chunk = None
-        totals = {k: 0.0 for k in ["loss", "recon", "ce", "vq", "acc", "binacc", "abs"]}
+        totals = {k: 0.0 for k in ["loss", "recon", "ce", "vq", "acc", "binacc", "abs", "nzrecall"]}
         samples = updates = 0
         code_counts = torch.zeros(unwrap(model).vq.num_embeddings, device=device)
 
@@ -524,15 +531,20 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
                 # bin presence accuracy (treat bin>0 as non-zero)
                 # compute predictions for presence similarly but re-use preds per chunk
                 total_bin_correct = 0
+                total_nonzero_true = 0
+                total_nonzero_tp = 0
                 for start in range(0, num_cells, cell_chunk):
                     end = min(num_cells, start + cell_chunk)
                     bias_chunk = cell_bias[start:end]
                     logits_chunk = per_gene_bin_logits.unsqueeze(1) + bias_chunk.unsqueeze(0)
                     preds = logits_chunk.argmax(dim=2)
-                    bin_pred = (preds > 0).float()
-                    bin_true = (x[:, start:end] > 0).float()
-                    total_bin_correct += (bin_pred == bin_true).sum().item()
+                    bin_pred_bool = (preds > 0)
+                    bin_true_bool = (x[:, start:end] > 0)
+                    total_bin_correct += (bin_pred_bool == bin_true_bool).sum().item()
+                    total_nonzero_true += int(bin_true_bool.sum().item())
+                    total_nonzero_tp += int((bin_pred_bool & bin_true_bool).sum().item())
                 bin_acc = float(total_bin_correct) / max(1, total_count)
+                nonzero_recall = float(total_nonzero_tp) / float(max(1, total_nonzero_true))
 
                 binc = torch.bincount(code_idx.view(-1).to(torch.int64),
                                       minlength=unwrap(model).vq.num_embeddings).float()
@@ -545,12 +557,13 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
             totals["vq"] += float(vq_loss.item()) * bs
             totals["acc"] += acc * bs
             totals["binacc"] += bin_acc * bs
+            totals["nzrecall"] += nonzero_recall * bs
             totals["abs"] += mean_abs_grad(model)
             samples += bs
             updates += 1
 
         # epoch summary
-        avg = {k: totals[k] / samples for k in ["loss", "recon", "ce", "vq", "acc", "binacc"]}
+        avg = {k: totals[k] / samples for k in ["loss", "recon", "ce", "vq", "acc", "binacc", "nzrecall"]}
         avg["abs"] = totals["abs"] / max(1, updates)
         curr_lr = scheduler.get_last_lr()[0]
 
@@ -562,12 +575,13 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
                 f"Epoch {epoch}/{epochs} "
                 f"Loss:{avg['loss']:.4f} Recon:{avg['recon']:.4f} (CE:{avg['ce']:.4f}) "
                 f"VQ:{avg['vq']:.4f} Acc:{avg['acc']:.4f} BinAcc:{avg['binacc']:.4f} "
+                f"NonZeroRec:{avg['nzrecall']:.4f} "
                 f"AbsGrad:{avg['abs']:.5f} Perp:{perplexity:.1f} VQw:{vq_weight:.3f} lr:{curr_lr:.5g}"
             )
             with open(log_filename, "a") as f:
                 f.write(
                     f"{epoch}\t{avg['loss']:.4f}\t{avg['recon']:.4f}\t{avg['ce']:.4f}\t{avg['vq']:.4f}\t"
-                    f"{avg['acc']:.4f}\t{avg['binacc']:.4f}\t{avg['abs']:.5f}\t"
+                    f"{avg['acc']:.4f}\t{avg['binacc']:.4f}\t{avg['nzrecall']:.4f}\t{avg['abs']:.5f}\t"
                     f"{perplexity:.2f}\t{vq_weight:.3f}\t{curr_lr:.5g}\t{epoch_cell_chunk}\n"
                 )
 
@@ -669,8 +683,9 @@ if __name__ == "__main__":
     else:
         data_name = os.path.splitext(os.path.basename(args.data))[0]
 
-    # Create result subdirectory: {dataSetName}_{epochCount}_{NumBin}_vqvae2_{timeStamp}
-    subdir_name = f"{data_name}_{args.epochs}_{args.bins}_vqvae2_{int(time.time())}"
+    # Create result subdirectory: {dataSetName}_{epochCount}_{NumBin}_vqvae2_<model>_{timeStamp}
+    # Include model identifier to make focal-loss results easy to find
+    subdir_name = f"{data_name}_{args.epochs}_{args.bins}_vqvae2_focal_{int(time.time())}"
     result_dir = os.path.join(args.result, subdir_name)
     os.makedirs(result_dir, exist_ok=False)
 
@@ -678,8 +693,8 @@ if __name__ == "__main__":
     log_path = os.path.join(result_dir, args.log_file)
     if args.dry_run:
         with open(log_path, "w") as f:
-            f.write("Epoch\tLoss\tRecon\tCE\tVQ\tAcc\tBinAcc\tAbsGrad\tPerp\tVQw\tLR\n")
-            f.write("DRYRUN\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\n")
+            f.write("Epoch\tLoss\tRecon\tCE\tVQ\tAcc\tBinAcc\tNonZeroRec\tAbsGrad\tPerp\tVQw\tLR\tCellChunk\n")
+            f.write("DRYRUN\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\n")
         print(f"Dry-run: created result directory and log at {result_dir}")
         raise SystemExit(0)
 
