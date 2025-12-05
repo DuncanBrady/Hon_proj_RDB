@@ -2,6 +2,8 @@
 import binning
 import genCoExp
 import scanpy as sc
+import numpy as np
+
 
 
 def load_data(file_path):
@@ -9,31 +11,58 @@ def load_data(file_path):
     if "data" in data.files:
         exp_matrix = data["data"]
     else:
-        exp_matrix = data[0]
+        exp_matrix = data[data.files[0]]  # Assume the first array in the npz file is the data
     genes = data["genes"] if "genes" in data.files else None
     cells = data["cells"] if "cells" in data.files else None
     assert exp_matrix is not None, "Data could not be loaded properly."
 
     return (exp_matrix, genes, cells)
 
-def preprocess_data(sc_adata, binning_method='term_freq', num_bins=7, coexp_method='spearman'):
+def save_files(sc_adata, original_file, binning_method, coexp_method, num_bins, top_n_genes):
+    # Save two npz files: binned data and co-expression matrix
+    # Create file name based on original file name and methods used
+    # binned data should save binned matrix, genes, cells
+    # co-expression matrix should save the co-expression matrix, genes
+    # Get full input file name without extension
+    input_name = original_file.split('.')[0]
+    binning_suffix = f"{binning_method}_bins{num_bins}"
+    if top_n_genes is not None:
+        binning_suffix += f"_top{top_n_genes}"
+        coexp_method += f"_top{top_n_genes}"
+    binned_output_name = f"{input_name}_{binning_suffix}.npz"
+    coexp_output_name = f"{input_name}_{coexp_method}.npz"
+    np.savez_compressed(binned_output_name, data=sc_adata.X, genes=sc_adata.var_names, cells=sc_adata.obs_names)
+    print(f"Binned data saved to {binned_output_name}")
+    if coexp_method is not None:
+        np.savez_compressed(coexp_output_name, coexp_matrix=sc_adata.varp['coexp_matrix'], genes=sc_adata.var_names)
+        print(f"Co-expression matrix saved to {coexp_output_name}")
+
+def bin_data(exp_matrix, binning_method='term_freq', num_bins=7):
     if binning_method == 'term_freq':
-        sc_adata.X = binning.term_freq_binning(sc_adata.X, num_bins)
-    elif binning_method == 'quantile':
-        sc_adata.X = binning.quantile_binning(sc_adata.X, num_bins)
+        binned_data = binning.term_freq_bin(exp_matrix, num_bins)
+    elif binning_method == 'k_means':
+        binned_data = binning.k_means_bin(exp_matrix, num_bins)
     else:
         raise ValueError(f"Unknown binning method: {binning_method}")
+    return binned_data
 
+def generate_coexp_matrix(exp_matrix, coexp_method='spearman'):
     if coexp_method == 'spearman':
-        sc_adata.varp['coexp_matrix']= genCoExp.spearman_corr(sc_adata.layers['counts'])
+        coexp_matrix = genCoExp.spearman_corr(exp_matrix)
     elif coexp_method == 'pearson':
-        sc_adata.varp['coexp_matrix'] = genCoExp.pearson_corr(sc_adata.layers['counts'])
+        coexp_matrix = genCoExp.pearson_corr(exp_matrix)
     elif coexp_method == 'covariance':
-        sc_adata.varp['coexp_matrix'] = genCoExp.genCoVar(sc_adata.layers['counts'])
+        coexp_matrix = genCoExp.genCoVar(exp_matrix)
     else:
         raise ValueError(f"Unknown co-expression method: {coexp_method}")
+    return coexp_matrix
 
-    return binned_data, sc_adata.var['coexp_matrix']
+def preprocess_data(sc_adata, binning_method='term_freq', num_bins=7, coexp_method=None):
+    # Bin the data
+    sc_adata.X = bin_data(sc_adata.X, binning_method, num_bins)
+    if coexp_method is not None:
+        sc_adata.varp['coexp_matrix'] = generate_coexp_matrix(sc_adata.layers['counts'], coexp_method)
+    return sc_adata
 
 def subset_top_expressed_genes(sc_data, top_n):
     sc_data.var['mean_expression'] = sc_data.X.mean(axis=0)
@@ -46,14 +75,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess single-cell data.")
     parser.add_argument('--file', type=str, required=True, help='Path to the input data file.')
     parser.add_argument('--binning_method', type=str, default='term_freq', help='Binning method to use.')
-    parser.add_argument('--num_bins', type=int, default=5, help='Number of bins for binning.')
+    parser.add_argument('--num_bins', type=int, default=7, help='Number of bins for binning.')
     parser.add_argument('--coexp_method', type=str, default='spearman', help='Co-expression calculation method.')
     parser.add_argument('--top_n_genes', type=int, default=None, help='Number of highest expressed genes to select.')
     args = parser.parse_args()
 
     exp_matrix, genes, cells = load_data(args.file)
     # check if the data needs to be transposed into cells x genes
-    if exp_matrix.shape[1] < exp_matrix.shape[0]:   
+    if exp_matrix.shape[0] < exp_matrix.shape[1]:   
         exp_matrix = exp_matrix.T
     # Create AnnData object for Scanpy compatibility
     sc_adata = sc.AnnData(exp_matrix)
@@ -63,7 +92,7 @@ if __name__ == "__main__":
     if args.top_n_genes is not None:
         sc_adata = subset_top_expressed_genes(sc_adata, args.top_n_genes)
     sc_adata.layers['counts'] = sc_adata.X.copy()
-    sc_adata = preprocess_data(sc_adata.X, args.binning_method, args.num_bins, args.coexp_method)
+    sc_adata = preprocess_data(sc_adata, args.binning_method, args.num_bins, args.coexp_method)
 
-    save_data(binned_data, 'binned_data.npy')
+    save_files(sc_adata, args.file, args.binning_method, args.coexp_method, args.num_bins, args.top_n_genes)
     print("Preprocessing complete.")

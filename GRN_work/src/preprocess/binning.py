@@ -10,7 +10,7 @@ def term_freq_bin(data, num_bins):
     non_zero_vals = data[non_zero_mask]
     #calculate percentage of values that are non-zero
     non_zero_percentage = len(non_zero_vals) / data.size * 100 if data.size > 0 else 0
-    print(f"Percentage of non-zero values: {non_zero_percentage:.2f}%")
+    print(f"Percentage of non-zero values: {non_zero_percentage:.2f}% in data of shape {data.shape}")
     if len(non_zero_vals) == 0:
         return data
 

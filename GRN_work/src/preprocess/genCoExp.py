@@ -78,8 +78,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Load the single-cell data
-    data = np.load(args.file, allow_pickle=True)
-    sc_data = data['data']  # Assuming the data is stored under the key 'data'
+    data = np.load(args.file, allow_pickle=True)  
+    # access matrix 
+    if "data" in data.files:
+        sc_data = data["data"]
+    else:
+        sc_data = data[data.files[0]]
     # Create file name based on file name and method
     input_name = os.path.basename(args.file).split('.')[0]
     output_name = f"{input_name}_{args.method}_coexp.npy"
