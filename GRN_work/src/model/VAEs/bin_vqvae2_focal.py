@@ -127,7 +127,7 @@ def choose_cell_chunk(device: torch.device, batch_size: int, bins: int, num_cell
 # Load SCT-normalised expression: genes x cells (non-negative)
 # ----------------------------
 def load_data(file_path: str, bins: int = 7):
-    data = np.load(file_path)
+    data = np.load(file_path, allow_pickle=True)
     sc_matrix = data['data'] if 'data' in data.keys() else None
     # Support archives where arrays are stored as arr_0 or single ndarray
     if sc_matrix is None:
@@ -187,6 +187,29 @@ class IndexedDataset(Dataset):
         return int(self.data.shape[0])
     def __getitem__(self, idx):
         return self.data[idx], idx  # return row + its gene id
+
+class IndexedSubsetDataset(Dataset):
+    """Dataset for gene-based splits: wraps a subset of genes."""
+    def __init__(self, data: torch.Tensor, gene_indices: torch.Tensor):
+        self.data = data
+        self.gene_indices = gene_indices  # indices into full gene tensor
+    def __len__(self):
+        return int(self.gene_indices.shape[0])
+    def __getitem__(self, idx):
+        gene_idx = self.gene_indices[idx]
+        return self.data[gene_idx], gene_idx
+
+class CellSplitDataset(Dataset):
+    """Dataset for cell-based splits: all genes, subset of cells."""
+    def __init__(self, data: torch.Tensor, cell_indices: torch.Tensor):
+        # data: [G, C_full], cell_indices: subset of cell indices
+        self.data = data[:, cell_indices]  # [G, C_subset]
+        self.cell_indices = cell_indices  # store global cell indices for bias indexing
+        self.gene_indices = torch.arange(data.shape[0])
+    def __len__(self):
+        return int(self.data.shape[0])
+    def __getitem__(self, idx):
+        return self.data[idx], idx
 
 # ----------------------------
 # Loss (same as your SCT setup)
@@ -275,15 +298,23 @@ def dynamic_acc_thresh(y_true: torch.Tensor) -> torch.Tensor:
 # Vector Quantizer
 # ----------------------------
 class VectorQuantizer(nn.Module):
-    """VQ layer with per-sample loss + straight-through estimator."""
-    def __init__(self, num_embeddings: int, embedding_dim: int, beta: float = 0.25):
+    """VQ layer with EMA updates, codebook reset, and straight-through estimator."""
+    def __init__(self, num_embeddings: int, embedding_dim: int, beta: float = 1.0, decay: float = 0.99, epsilon: float = 1e-5):
         super().__init__()
         self.num_embeddings = int(num_embeddings)
         self.embedding_dim = int(embedding_dim)
         self.beta = float(beta)
+        self.decay = float(decay)
+        self.epsilon = float(epsilon)
+        
+        # Codebook
         self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
         nn.init.uniform_(self.embedding.weight, -1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
-
+        
+        # EMA tracking buffers
+        self.register_buffer('cluster_size', torch.zeros(num_embeddings))
+        self.register_buffer('embed_avg', self.embedding.weight.data.clone())
+        
     def forward(self, z_e: torch.Tensor):
         # z_e: [B, D]
         flat = z_e.view(-1, self.embedding_dim)
@@ -296,10 +327,46 @@ class VectorQuantizer(nn.Module):
         indices = torch.argmin(dist, dim=1)                  # [B]
         z_q = e[indices]                                     # [B, D]
 
-        # Losses
-        embed_loss_vec  = ((z_q - z_e.detach()) ** 2).mean(dim=1)   # [B]
+        # EMA updates during training
+        if self.training:
+            # One-hot encoding of indices
+            encodings = F.one_hot(indices, self.num_embeddings).float()  # [B, K]
+            
+            # Update cluster sizes with EMA
+            self.cluster_size.mul_(self.decay).add_(
+                encodings.sum(0), alpha=1 - self.decay
+            )
+            
+            # Update embedding averages
+            embed_sum = flat.t() @ encodings  # [D, K]
+            self.embed_avg.mul_(self.decay).add_(
+                embed_sum.t(), alpha=1 - self.decay
+            )
+            
+            # Laplace smoothing and normalize
+            n = self.cluster_size.sum()
+            cluster_size = (
+                (self.cluster_size + self.epsilon)
+                / (n + self.num_embeddings * self.epsilon)
+                * n
+            )
+            embed_normalized = self.embed_avg / cluster_size.unsqueeze(1)
+            self.embedding.weight.data.copy_(embed_normalized)
+            
+            # Reset unused codes to random encoder outputs
+            # If a code hasn't been used (cluster_size very small), reinitialize it
+            unused_mask = (self.cluster_size < 1.0)
+            if unused_mask.any() and flat.size(0) > 0:
+                # Randomly sample from current batch to reinitialize
+                n_unused = unused_mask.sum().item()
+                if n_unused > 0:
+                    random_indices = torch.randint(0, flat.size(0), (n_unused,), device=flat.device)
+                    self.embedding.weight.data[unused_mask] = flat[random_indices]
+                    self.cluster_size[unused_mask] = 1.0
+
+        # Losses (only commitment loss for encoder, embedding updates via EMA)
         commit_loss_vec = ((z_e - z_q.detach()) ** 2).mean(dim=1)   # [B]
-        vq_loss_vec = embed_loss_vec + self.beta * commit_loss_vec  # [B]
+        vq_loss_vec = self.beta * commit_loss_vec  # [B]
 
         # Straight-through estimator
         z_q_st = z_e + (z_q - z_e).detach()
@@ -319,8 +386,8 @@ class VQAutoDecoder(nn.Module):
         nn.init.normal_(self.gene_embed.weight, mean=0.0, std=0.02)
         self.ln = nn.LayerNorm(latent_dim)
 
-        # VQ layer on the latent
-        self.vq = VectorQuantizer(codebook_size, latent_dim, beta=vq_beta)
+        # VQ layer on the latent (with EMA updates)
+        self.vq = VectorQuantizer(codebook_size, latent_dim, beta=vq_beta, decay=0.99)
 
 
         # Decoder (latent -> per-gene logits over bins)
@@ -356,61 +423,208 @@ class VQAutoDecoder(nn.Module):
 # Reconstruct full matrix using the decoder only
 # ----------------------------
 @torch.no_grad()
-def reconstruct_full(model: nn.Module, device: torch.device, batch_size: int = 256):
+def reconstruct_full(model: nn.Module, device: torch.device, batch_size: int = 256, gene_indices=None, cell_indices=None):
+    """Reconstruct expression matrix.
+    
+    Args:
+        model: The VQAutoDecoder model
+        device: torch device
+        batch_size: batch size for reconstruction
+        gene_indices: if provided, only reconstruct these genes (for gene-based splits)
+        cell_indices: if provided, only use these cells (for cell-based splits)
+    """
     model.eval()
     G, C = gene_tensor.shape
-    recon = np.empty((G, C), dtype=np.float32)
-    loader = DataLoader(IndexedDataset(gene_tensor), batch_size=batch_size, shuffle=False)
+    
+    # Determine which genes to reconstruct
+    if gene_indices is not None:
+        genes_to_recon = gene_indices
+        G_recon = len(gene_indices)
+    else:
+        genes_to_recon = torch.arange(G)
+        G_recon = G
+    
+    # Determine which cells to use
+    if cell_indices is not None:
+        C_recon = len(cell_indices)
+        cell_bias_subset = unwrap(model).cell_bin_bias[cell_indices]
+    else:
+        C_recon = C
+        cell_bias_subset = unwrap(model).cell_bin_bias
+    
+    recon = np.empty((G_recon, C_recon), dtype=np.float32)
+    
+    # Create dataloader for genes to reconstruct
+    if gene_indices is not None:
+        loader_data = gene_tensor[gene_indices]
+    else:
+        loader_data = gene_tensor
+    loader = DataLoader(IndexedDataset(loader_data), batch_size=batch_size, shuffle=False)
+    
+    recon_idx = 0
     for _, idx in loader:
-        idx = idx.to(device)
-        per_gene_bin_logits, *_ = model(idx)
-        # For each gene in the batch compute per-cell argmax without allocating full [B,C,K]
+        # idx here is relative to the loader_data
+        # we need the actual gene indices
+        if gene_indices is not None:
+            actual_gene_idx = genes_to_recon[idx]
+        else:
+            actual_gene_idx = idx
+        
+        actual_gene_idx = actual_gene_idx.to(device)
+        per_gene_bin_logits, *_ = model(actual_gene_idx)
         # per_gene_bin_logits: [B, K]
-        cell_bias = unwrap(model).cell_bin_bias.to(per_gene_bin_logits.device)
-        for i_in_batch, gidx in enumerate(idx):
+        cell_bias = cell_bias_subset.to(per_gene_bin_logits.device)
+        
+        for i_in_batch in range(per_gene_bin_logits.size(0)):
             p_bk = per_gene_bin_logits[i_in_batch]      # [K]
             # compute per-cell logits: p_bk (1,K) + cell_bias (C,K) -> (C,K)
             sums = (p_bk.unsqueeze(0) + cell_bias).cpu().numpy()   # (C,K)
             pred_bins = np.argmax(sums, axis=1).astype(np.float32)  # (C,)
-            recon[gidx.cpu().numpy(), :] = pred_bins
+            recon[recon_idx, :] = pred_bins
+            recon_idx += 1
+    
     return recon
+
+# ----------------------------
+# Evaluation function
+# ----------------------------
+@torch.no_grad()
+def evaluate_model(model, dataloader, device, loss_fn, vq_weight=1.0, split_name="val"):
+    """Evaluate model on a validation/test set.
+    
+    Returns dict with metrics: loss, recon, ce, vq, acc, binacc, nzrecall
+    """
+    model.eval()
+    totals = {k: 0.0 for k in ["loss", "recon", "ce", "vq", "acc", "binacc", "nzrecall"]}
+    samples = 0
+    
+    for x, idx in dataloader:
+        x = x.long().to(device, non_blocking=True)
+        idx = idx.to(device)
+        
+        per_gene_bin_logits, z_q, vq_loss_vec, z_e, code_idx = model(idx)
+        K = per_gene_bin_logits.size(1)
+        
+        # Compute loss in cell chunks
+        total_ce_sum = per_gene_bin_logits.new_zeros(())
+        total_elems = 0
+        # Use the actual number of cells in this batch (for cell-based splits, x.size(1) is the subset size)
+        num_cells_in_batch = x.size(1)
+        bs = x.size(0)
+        cell_chunk = choose_cell_chunk(device, batch_size=bs, bins=K, num_cells=num_cells_in_batch)
+        cell_bias = unwrap(model).cell_bin_bias.to(per_gene_bin_logits.device)
+        
+        for start in range(0, num_cells_in_batch, cell_chunk):
+            end = min(num_cells_in_batch, start + cell_chunk)
+            # For cell-based splits, need to map to global cell indices if dataset has them
+            if hasattr(dataloader.dataset, 'cell_indices'):
+                global_cell_indices = dataloader.dataset.cell_indices[start:end].to(device)
+                bias_chunk = cell_bias[global_cell_indices]
+            else:
+                bias_chunk = cell_bias[start:end]
+            logits_chunk = per_gene_bin_logits.unsqueeze(1) + bias_chunk.unsqueeze(0)
+            logits_flat = logits_chunk.reshape(-1, K)
+            targets_chunk = x[:, start:end].reshape(-1)
+            fl_sum, _, _ = loss_fn(logits_flat, targets_chunk.long())
+            total_ce_sum = total_ce_sum + fl_sum
+            total_elems += logits_flat.size(0)
+        
+        recon_loss = total_ce_sum / float(total_elems)
+        ce_loss = recon_loss
+        vq_loss = vq_loss_vec.mean()
+        loss = recon_loss + vq_weight * vq_loss
+        
+        # Compute metrics
+        total_correct = 0
+        total_count = 0
+        total_bin_correct = 0
+        total_nonzero_true = 0
+        total_nonzero_tp = 0
+        
+        for start in range(0, num_cells_in_batch, cell_chunk):
+            end = min(num_cells_in_batch, start + cell_chunk)
+            if hasattr(dataloader.dataset, 'cell_indices'):
+                global_cell_indices = dataloader.dataset.cell_indices[start:end].to(device)
+                bias_chunk = cell_bias[global_cell_indices]
+            else:
+                bias_chunk = cell_bias[start:end]
+            logits_chunk = per_gene_bin_logits.unsqueeze(1) + bias_chunk.unsqueeze(0)
+            preds = logits_chunk.argmax(dim=2)
+            targ = x[:, start:end]
+            
+            total_correct += (preds == targ).sum().item()
+            total_count += preds.numel()
+            
+            bin_pred_bool = (preds > 0)
+            bin_true_bool = (targ > 0)
+            total_bin_correct += (bin_pred_bool == bin_true_bool).sum().item()
+            total_nonzero_true += int(bin_true_bool.sum().item())
+            total_nonzero_tp += int((bin_pred_bool & bin_true_bool).sum().item())
+        
+        acc = float(total_correct) / max(1, total_count)
+        bin_acc = float(total_bin_correct) / max(1, total_count)
+        nonzero_recall = float(total_nonzero_tp) / float(max(1, total_nonzero_true))
+        
+        bs = x.size(0)
+        totals["loss"] += float(loss.item()) * bs
+        totals["recon"] += float(recon_loss.item()) * bs
+        totals["ce"] += float(ce_loss.item()) * bs
+        totals["vq"] += float(vq_loss.item()) * bs
+        totals["acc"] += acc * bs
+        totals["binacc"] += bin_acc * bs
+        totals["nzrecall"] += nonzero_recall * bs
+        samples += bs
+    
+    avg = {k: totals[k] / samples for k in totals.keys()}
+    return avg
 
 # ----------------------------
 # Training
 # ----------------------------
-def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autodecoder_metrics.txt",
+def train_vq_autodecoder(train_loader, val_loader, device, epochs=800, log_filename="vq_autodecoder_metrics.txt",
                          init_dispersion: float = 1.0, lr: float = 0.005, bins: int = 7,
                          checkpoint_freq: int = 50, result_dir: str = None,
-                         focal_gamma: float = 2.0, focal_alpha=None):
+                         focal_gamma: float = 2.0, focal_alpha=None, train_cell_indices=None, val_cell_indices=None):
     G, C = gene_tensor.shape
+    # Validation frequency: 10% of total epochs, but at least once every 10 epochs
+    validation_freq = max(10, int(0.1 * epochs))
     # Model (binned-only)
     # Determine actual number of bins/classes from the loaded data to avoid target-out-of-range
     bins_used = int(gene_tensor.max().item()) + 1
     assert bins_used > 0, "Computed bins_used must be > 0"
     model = VQAutoDecoder(num_genes=G, num_cells=C,
                           latent_dim=128, hidden_dim1=2048, hidden_dim2=1024,
-                          codebook_size=1024, vq_beta=0.25, init_dispersion=init_dispersion,
+                          codebook_size=1024, vq_beta=1.0, init_dispersion=init_dispersion,
                           bins=bins_used).to(device)
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
-    # Optim/sched
+    # Optim/sched: Use cosine annealing with warmup for more stable training
     optimizer = optim.AdamW(model.parameters(), lr=lr)
-    scheduler = OneCycleLR(
-        optimizer, max_lr=lr,
-        total_steps=epochs * len(dataloader),
-        pct_start=0.1, anneal_strategy='cos',
-        div_factor=10.0, final_div_factor=100.0,
-        cycle_momentum=False
-    )
-    clip_norm = 1.0
+    
+    # Warmup for first 10% of training, then cosine decay to 5% of peak LR
+    # Start warmup from 0.1 (not 0) to avoid near-zero gradients at start
+    warmup_epochs = max(1, int(0.1 * epochs))
+    total_steps = epochs * len(train_loader)
+    warmup_steps = warmup_epochs * len(train_loader)
+    
+    def lr_lambda(step):
+        if step < warmup_steps:
+            # Linear warmup from 0.3 to 1.0 (higher start for stronger gradients)
+            return 0.3 + 0.7 * (float(step) / float(max(1, warmup_steps)))
+        # Cosine annealing from 1.0 to 0.1 (higher minimum)
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    clip_norm = 5.0  # Increased from 1.0 to allow larger gradients
 
     # Loss (categorical focal loss over bins)
     # Use focal loss with provided gamma/alpha. alpha may be a scalar or per-class vector.
     loss_fn = FocalBinnedLoss(gamma=float(focal_gamma), alpha=focal_alpha, reduction='sum')
-    vq_weight_start, vq_weight_end, warmup_epochs = 1e-3, 1.0, int(0.25 * epochs)
-    # AMP: use mixed precision on CUDA to save memory and speed up training
-    use_amp = (device.type == 'cuda') and torch.cuda.is_available()
+    vq_weight_start, vq_weight_end, vq_warmup_epochs = 0.5, 1.0, int(0.05 * epochs)  # Start at 0.5, shorter warmup
+    # AMP: Disabled to prevent gradient underflow
+    use_amp = False  # Disabled - AMP can cause gradient vanishing
     # Create a GradScaler in a way that's compatible across PyTorch versions.
     scaler = None
     if use_amp:
@@ -429,16 +643,32 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
         f.write("Epoch\tLoss\tRecon\tCE\tVQ\tAcc\tBinAcc\tNonZeroRec\tAbsGrad\tPerp\tVQw\tLR\tCellChunk\n")
 
     # Log AMP usage and an initial cell_chunk suggestion so it's recorded in the run log
-    bs = getattr(dataloader, 'batch_size', 1) or 1
+    bs = getattr(train_loader, 'batch_size', 1) or 1
     try:
         init_cell_chunk = choose_cell_chunk(device, batch_size=bs, bins=bins_used, num_cells=unwrap(model)._num_cells)
     except Exception:
         init_cell_chunk = None
     print(f"AMP enabled: {use_amp}, initial cell_chunk: {init_cell_chunk}")
+    print(f"Validation frequency: every {validation_freq} epochs")
     with open(log_filename, "a") as f:
-        f.write(f"#AMP:{use_amp}\tinit_cell_chunk:{init_cell_chunk}\n")
+        f.write(f"#AMP:{use_amp}\tinit_cell_chunk:{init_cell_chunk}\tvalidation_freq:{validation_freq}\n")
+    
+    # Add validation metrics header
+    if val_loader is not None:
+        with open(log_filename, "a") as f:
+            f.write("#Validation metrics: Val_Loss, Val_Recon, Val_CE, Val_VQ, Val_Acc, Val_BinAcc, Val_NonZeroRec\n")
 
-    best_acc = 0.0
+    best_val_loss = float('inf')
+    best_epoch = 0
+    patience = 5  # Early stopping patience (validation checks without improvement)
+    patience_counter = 0
+    
+    # Thresholds for gradient/perplexity-based early stopping
+    min_abs_grad = 1e-7  # Stop if gradients vanish (relaxed to 1e-7)
+    min_perplexity = 100  # Stop if codebook collapses (< 100 codes used for 1024 codebook)
+    perplexity_patience = 3  # Number of validation checks with low perplexity before stopping
+    low_perplexity_counter = 0
+    
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_cell_chunk = None
@@ -447,10 +677,10 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
         code_counts = torch.zeros(unwrap(model).vq.num_embeddings, device=device)
 
         # VQ warmup
-        t = min(1.0, epoch / max(1, warmup_epochs))
+        t = min(1.0, epoch / max(1, vq_warmup_epochs))
         vq_weight = vq_weight_start + t * (vq_weight_end - vq_weight_start)
 
-        for x, idx in dataloader:
+        for x, idx in train_loader:
             # x: [B, C] integer bin targets; idx: [B] gene ids
             x = x.long().to(device, non_blocking=True)
             idx = idx.to(device)
@@ -468,9 +698,10 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
                 total_ce_sum = per_gene_bin_logits.new_zeros(())
                 total_elems = 0
                 # choose a reasonable cell chunk size (auto-tuned based on available memory)
-                num_cells = unwrap(model)._num_cells
+                # For cell-based splits, x has shape [B, C_subset], so use x.size(1) as num_cells
+                num_cells_in_batch = x.size(1)  # actual number of cells in this batch (train or val subset)
                 bs = x.size(0)
-                cell_chunk = choose_cell_chunk(device, batch_size=bs, bins=K, num_cells=num_cells)
+                cell_chunk = choose_cell_chunk(device, batch_size=bs, bins=K, num_cells=num_cells_in_batch)
                 # record the first chosen chunk for this epoch so we can log it
                 if epoch_cell_chunk is None:
                     try:
@@ -478,10 +709,16 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
                     except Exception:
                         epoch_cell_chunk = None
                 # make sure cell_bin_bias is on the device
-                cell_bias = unwrap(model).cell_bin_bias.to(per_gene_bin_logits.device)
-                for start in range(0, num_cells, cell_chunk):
-                    end = min(num_cells, start + cell_chunk)
-                    bias_chunk = cell_bias[start:end]           # [chunk, K]
+                cell_bias_full = unwrap(model).cell_bin_bias.to(per_gene_bin_logits.device)
+                for start in range(0, num_cells_in_batch, cell_chunk):
+                    end = min(num_cells_in_batch, start + cell_chunk)
+                    # For cell-based splits, map local cell positions to global cell indices
+                    if train_cell_indices is not None:
+                        global_cell_indices = train_cell_indices[start:end].to(device)
+                        bias_chunk = cell_bias_full[global_cell_indices]
+                    else:
+                        # Gene-based split: use all cells sequentially
+                        bias_chunk = cell_bias_full[start:end]
                     # broadcasts: per_gene_bin_logits: [B, K] -> [B, chunk, K]
                     logits_chunk = per_gene_bin_logits.unsqueeze(1) + bias_chunk.unsqueeze(0)
                     logits_flat = logits_chunk.reshape(-1, K)  # [B*chunk, K]
@@ -519,9 +756,13 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
                 total_count = 0
                 # reuse the same chunk choice used for loss computation to keep metrics consistent
                 cell_bias = unwrap(model).cell_bin_bias.to(per_gene_bin_logits.device)
-                for start in range(0, num_cells, cell_chunk):
-                    end = min(num_cells, start + cell_chunk)
-                    bias_chunk = cell_bias[start:end]
+                for start in range(0, num_cells_in_batch, cell_chunk):
+                    end = min(num_cells_in_batch, start + cell_chunk)
+                    if train_cell_indices is not None:
+                        global_cell_indices = train_cell_indices[start:end].to(device)
+                        bias_chunk = cell_bias[global_cell_indices]
+                    else:
+                        bias_chunk = cell_bias[start:end]
                     logits_chunk = per_gene_bin_logits.unsqueeze(1) + bias_chunk.unsqueeze(0)  # [B, chunk, K]
                     preds = logits_chunk.argmax(dim=2)
                     targ = x[:, start:end]
@@ -533,9 +774,13 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
                 total_bin_correct = 0
                 total_nonzero_true = 0
                 total_nonzero_tp = 0
-                for start in range(0, num_cells, cell_chunk):
-                    end = min(num_cells, start + cell_chunk)
-                    bias_chunk = cell_bias[start:end]
+                for start in range(0, num_cells_in_batch, cell_chunk):
+                    end = min(num_cells_in_batch, start + cell_chunk)
+                    if train_cell_indices is not None:
+                        global_cell_indices = train_cell_indices[start:end].to(device)
+                        bias_chunk = cell_bias[global_cell_indices]
+                    else:
+                        bias_chunk = cell_bias[start:end]
                     logits_chunk = per_gene_bin_logits.unsqueeze(1) + bias_chunk.unsqueeze(0)
                     preds = logits_chunk.argmax(dim=2)
                     bin_pred_bool = (preds > 0)
@@ -570,19 +815,75 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
         probs = code_counts / (code_counts.sum() + 1e-8)
         perplexity = torch.exp(-(probs * (probs.add(1e-8).log())).sum()).item()
 
+        # Check for gradient vanishing (only after warmup completes)
+        if epoch > warmup_epochs and avg["abs"] < min_abs_grad:
+            print(f"\nEarly stopping triggered at epoch {epoch}: Gradients vanished (AbsGrad={avg['abs']:.2e} < {min_abs_grad:.2e})")
+            print(f"This indicates the model has stopped learning or encountered gradient collapse.")
+            break
+        
+        # Validation evaluation - only run every validation_freq epochs
+        val_metrics = None
+        if val_loader is not None and epoch % validation_freq == 0:
+            val_metrics = evaluate_model(model, val_loader, device, loss_fn, vq_weight=vq_weight, split_name="val")
+            model.train()  # switch back to training mode
+            
+            # Check for codebook collapse
+            if perplexity < min_perplexity:
+                low_perplexity_counter += 1
+                if low_perplexity_counter >= perplexity_patience:
+                    print(f"\nEarly stopping triggered at epoch {epoch}: Codebook collapse detected")
+                    print(f"Perplexity={perplexity:.1f} has been below {min_perplexity} for {low_perplexity_counter} validation checks.")
+                    print(f"Only ~{int(perplexity)} of {unwrap(model).vq.num_embeddings} codebook entries are being used.")
+                    break
+            else:
+                low_perplexity_counter = 0  # Reset if perplexity recovers
+            
+            # Early stopping check based on validation loss
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                best_epoch = epoch
+                patience_counter = 0
+                # Save best model
+                if result_dir is not None:
+                    best_model_path = os.path.join(result_dir, "best_model.pth")
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'val_loss': best_val_loss,
+                    }, best_model_path)
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"\nEarly stopping triggered after {patience_counter} validation checks ({patience_counter * validation_freq} epochs) without improvement.")
+                    print(f"Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
+                    break
+        
+        # Log and print metrics every 10 epochs
         if epoch % 10 == 0:
+            val_str = ""
+            if val_metrics is not None:
+                val_str = (f" | Val: Loss:{val_metrics['loss']:.4f} Acc:{val_metrics['acc']:.4f} "
+                          f"BinAcc:{val_metrics['binacc']:.4f} NZRec:{val_metrics['nzrecall']:.4f}")
+            
             print(
                 f"Epoch {epoch}/{epochs} "
                 f"Loss:{avg['loss']:.4f} Recon:{avg['recon']:.4f} (CE:{avg['ce']:.4f}) "
                 f"VQ:{avg['vq']:.4f} Acc:{avg['acc']:.4f} BinAcc:{avg['binacc']:.4f} "
                 f"NonZeroRec:{avg['nzrecall']:.4f} "
                 f"AbsGrad:{avg['abs']:.5f} Perp:{perplexity:.1f} VQw:{vq_weight:.3f} lr:{curr_lr:.5g}"
+                f"{val_str}"
             )
             with open(log_filename, "a") as f:
+                val_log = ""
+                if val_metrics is not None:
+                    val_log = (f"\t{val_metrics['loss']:.4f}\t{val_metrics['recon']:.4f}\t{val_metrics['ce']:.4f}\t"
+                              f"{val_metrics['vq']:.4f}\t{val_metrics['acc']:.4f}\t{val_metrics['binacc']:.4f}\t"
+                              f"{val_metrics['nzrecall']:.4f}")
                 f.write(
                     f"{epoch}\t{avg['loss']:.4f}\t{avg['recon']:.4f}\t{avg['ce']:.4f}\t{avg['vq']:.4f}\t"
                     f"{avg['acc']:.4f}\t{avg['binacc']:.4f}\t{avg['nzrecall']:.4f}\t{avg['abs']:.5f}\t"
-                    f"{perplexity:.2f}\t{vq_weight:.3f}\t{curr_lr:.5g}\t{epoch_cell_chunk}\n"
+                    f"{perplexity:.2f}\t{vq_weight:.3f}\t{curr_lr:.5g}\t{epoch_cell_chunk}{val_log}\n"
                 )
 
         # Periodic checkpointing
@@ -629,9 +930,12 @@ def train_vq_autodecoder(dataloader, device, epochs=800, log_filename="vq_autode
                 # reconstruction is saved once at the end of training.
             model.train()
 
-        if avg["acc"] > best_acc:
-            best_acc = avg["acc"]
-
+    # Load best model before returning
+    if result_dir is not None and os.path.exists(os.path.join(result_dir, "best_model.pth")):
+        print(f"\nLoading best model from epoch {best_epoch} with validation loss {best_val_loss:.4f}")
+        checkpoint = torch.load(os.path.join(result_dir, "best_model.pth"))
+        model.load_state_dict(checkpoint['model_state_dict'])
+    
     return model
 
 # ----------------------------
@@ -651,17 +955,19 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=4000)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=0.005)
+    parser.add_argument("--lr", type=float, default=0.0015)
     parser.add_argument("--log-file", type=str, default="vqvae2_metrics.txt")
     parser.add_argument("--class-weights", type=str, default=None,
                         help="Path to .npy file or comma-separated list of class weights; if omitted, inverse-term-frequency weights are used by default")
-    parser.add_argument("--focal-gamma", type=float, default=2.0, help="Gamma parameter for focal loss")
+    parser.add_argument("--focal-gamma", type=float, default=1.5, help="Gamma parameter for focal loss")
     parser.add_argument("--focal-alpha", type=str, default=None,
                         help="Alpha for focal loss: scalar or comma-separated list / .npy path for per-class weights")
     parser.add_argument("--max-cells", type=int, default=0,
                         help="If >0, truncate each gene row to the first N cells (useful for smoke tests)")
     parser.add_argument("--device", type=str, default="auto", choices=["auto","cpu","cuda"],
                         help="Device to run on: 'auto' respects availability, or force 'cpu'/'cuda'")
+    parser.add_argument("--split-by", type=str, default="genes", choices=["genes", "cells"],
+                        help="Split strategy: 'genes' for gene-based split, 'cells' for cell-based split")
     args = parser.parse_args()
 
     reserve_mem_all_gpus(TARGET_FRACTION)
@@ -706,8 +1012,50 @@ if __name__ == "__main__":
         gene_tensor = gene_tensor[:, :args.max_cells].contiguous()
     G, C = gene_tensor.shape
 
-    ds = IndexedDataset(gene_tensor)
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.num_workers)
+    # Create train/val/test split based on --split-by argument
+    # Split: 70% train, 15% validation, 15% test
+    print(f"Creating 70/15/15 train-validation-test split by {args.split_by}")
+    if args.split_by == "genes":
+        # Gene-based split: split genes into train/val/test
+        num_genes = G
+        indices = torch.randperm(num_genes)
+        train_split_idx = int(0.7 * num_genes)
+        val_split_idx = int(0.85 * num_genes)
+        
+        train_gene_indices = indices[:train_split_idx]
+        val_gene_indices = indices[train_split_idx:val_split_idx]
+        test_gene_indices = indices[val_split_idx:]
+        
+        train_ds = IndexedSubsetDataset(gene_tensor, train_gene_indices)
+        val_ds = IndexedSubsetDataset(gene_tensor, val_gene_indices)
+        test_ds = IndexedSubsetDataset(gene_tensor, test_gene_indices)
+        
+        train_cell_indices = None
+        val_cell_indices = None
+        test_cell_indices = None
+        
+        print(f"Gene-based split: {len(train_gene_indices)} train genes, {len(val_gene_indices)} val genes, {len(test_gene_indices)} test genes")
+        
+    else:  # args.split_by == "cells"
+        # Cell-based split: split cells into train/val/test
+        num_cells = C
+        indices = torch.randperm(num_cells)
+        train_split_idx = int(0.7 * num_cells)
+        val_split_idx = int(0.85 * num_cells)
+        
+        train_cell_indices = indices[:train_split_idx]
+        val_cell_indices = indices[train_split_idx:val_split_idx]
+        test_cell_indices = indices[val_split_idx:]
+        
+        train_ds = CellSplitDataset(gene_tensor, train_cell_indices)
+        val_ds = CellSplitDataset(gene_tensor, val_cell_indices)
+        test_ds = CellSplitDataset(gene_tensor, test_cell_indices)
+        
+        print(f"Cell-based split: {len(train_cell_indices)} train cells, {len(val_cell_indices)} val cells, {len(test_cell_indices)} test cells")
+    
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.num_workers)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=args.num_workers)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=args.num_workers)
 
     # parse class-weights / focal-alpha CLI args: path to .npy or comma-separated list
     class_weights = None
@@ -755,21 +1103,68 @@ if __name__ == "__main__":
         focal_alpha = class_weights
 
     # pass full path for log file so training writes into the result dir
-    model = train_vq_autodecoder(dl, device, epochs=args.epochs, log_filename=log_path,
+    # Note: test_loader is NOT passed to training - it's held out completely
+    model = train_vq_autodecoder(train_loader, val_loader, device, epochs=args.epochs, log_filename=log_path,
                                  init_dispersion=args.init_dispersion, lr=args.lr, bins=args.bins,
                                  checkpoint_freq=50, result_dir=result_dir,
-                                 focal_gamma=args.focal_gamma, focal_alpha=focal_alpha)
+                                 focal_gamma=args.focal_gamma, focal_alpha=focal_alpha,
+                                 train_cell_indices=train_cell_indices if args.split_by == "cells" else None,
+                                 val_cell_indices=val_cell_indices if args.split_by == "cells" else None)
 
     # Save weights
     torch.save(model.state_dict(), os.path.join(result_dir, "vqvae2_model.pth"))
     print(f"Saved model to {result_dir}.")
 
-    # Recon + save
+    # Recon + save (full matrix)
     recon = reconstruct_full(model, device, batch_size=256)
     np.savez_compressed(os.path.join(result_dir, "vqvae2_recon.npz"), reconstructed_matrix=recon)
+    
+    # Save separate train/val/test reconstructions for evaluation
+    if args.split_by == "genes":
+        train_recon = reconstruct_full(model, device, batch_size=256, gene_indices=train_gene_indices)
+        val_recon = reconstruct_full(model, device, batch_size=256, gene_indices=val_gene_indices)
+        test_recon = reconstruct_full(model, device, batch_size=256, gene_indices=test_gene_indices)
+        np.savez_compressed(os.path.join(result_dir, "vqvae2_recon_train.npz"), 
+                           reconstructed_matrix=train_recon, gene_indices=train_gene_indices.numpy())
+        np.savez_compressed(os.path.join(result_dir, "vqvae2_recon_val.npz"), 
+                           reconstructed_matrix=val_recon, gene_indices=val_gene_indices.numpy())
+        np.savez_compressed(os.path.join(result_dir, "vqvae2_recon_test.npz"), 
+                           reconstructed_matrix=test_recon, gene_indices=test_gene_indices.numpy())
+    else:
+        # For cell splits, save full reconstruction but mark which cells were train/val/test
+        np.savez_compressed(os.path.join(result_dir, "vqvae2_recon_train.npz"), 
+                           reconstructed_matrix=recon, cell_indices=train_cell_indices.numpy())
+        np.savez_compressed(os.path.join(result_dir, "vqvae2_recon_val.npz"), 
+                           reconstructed_matrix=recon, cell_indices=val_cell_indices.numpy())
+        np.savez_compressed(os.path.join(result_dir, "vqvae2_recon_test.npz"), 
+                           reconstructed_matrix=recon, cell_indices=test_cell_indices.numpy())
 
     # Do not print the full reconstructed matrix to stdout (it can be huge).
     # The reconstruction is saved to disk above as a compressed .npz file.
+    
+    # Final test set evaluation (held out during training)
+    print("\n" + "="*60)
+    print(f"Final Test Set Evaluation (split by {args.split_by}):")
+    print("="*60)
+    loss_fn = FocalBinnedLoss(gamma=float(args.focal_gamma), alpha=focal_alpha, reduction='sum')
+    final_test_metrics = evaluate_model(model, test_loader, device, loss_fn, vq_weight=1.0, split_name="test")
+    print(f"Test Loss: {final_test_metrics['loss']:.4f}")
+    print(f"Test Reconstruction Loss: {final_test_metrics['recon']:.4f}")
+    print(f"Test Accuracy: {final_test_metrics['acc']:.4f}")
+    print(f"Test Binary Accuracy: {final_test_metrics['binacc']:.4f}")
+    print(f"Test Non-Zero Recall: {final_test_metrics['nzrecall']:.4f}")
+    
+    # Save test metrics to file
+    with open(os.path.join(result_dir, "test_metrics.txt"), "w") as f:
+        f.write(f"Final Test Set Metrics (split by {args.split_by})\n")
+        f.write("="*60 + "\n")
+        if args.split_by == "genes":
+            f.write(f"Train genes: {len(train_gene_indices)}, Val genes: {len(val_gene_indices)}, Test genes: {len(test_gene_indices)}\n")
+        else:
+            f.write(f"Train cells: {len(train_cell_indices)}, Val cells: {len(val_cell_indices)}, Test cells: {len(test_cell_indices)}\n")
+        f.write("\n")
+        for key, val in final_test_metrics.items():
+            f.write(f"{key}: {val:.6f}\n")
 
     # Export latents for every gene
     model = unwrap(model)
